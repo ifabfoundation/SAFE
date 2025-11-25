@@ -130,6 +130,16 @@ A robust setting used for deployment trials is:
 * On-device (STM32) deltas vs TFLite: ΔMAX ≈ 0.052 (≈ 1 LSB) → numerically equivalent implementation
 
 > **Definition of LSB (Least Significant Bit):** the quantization step size (`scale`) of the output tensor. According to the [TensorFlow Lite Quantization Specification](https://www.tensorflow.org/lite/performance/quantization_spec) the reconstruction formula is (r = (q - zp) \times scale) and any difference ≤ 1 LSB is considered *“bit-exact within quantization precision”*. ([fdmcs.math.cnrs.fr][1])
+>
+> ## [ADD CHANGES]
+
+## [ADD CHANGES]
+
+## [ADD CHANGES]
+
+## [ADD CHANGES]
+
+## [ADD CHANGES]
 
 ---
 
