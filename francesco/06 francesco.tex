@@ -1,0 +1,2879 @@
+\section{Francesco - ITA}\label{sec:francesco}
+
+% Encoding and language
+
+\newenvironment{cverbatim}
+  {\begin{center}\begin{minipage}{0.7\linewidth}\begin{verbatim}}
+  {\end{verbatim}\end{minipage}\end{center}}
+
+
+
+\section{Sezione 1 -- Indagine su architetture disponibili}
+
+L’obiettivo del progetto è quello di sviluppare un modello AI che sia in grado di predire in anticipo un’anomalia di una certa macchina.
+
+Innanzitutto sono disponibili i dati campionati da essa con il seguente intervallo temporale:
+
+\begin{center}
+    24 ott 2024 11:18:23 -- 20 gen 2025 16:00:15
+\end{center}
+
+
+Campionato a 1Hz, si hanno 88g 4h 41m 52s. Sono quindi presenti 21 valori che cambiano nel tempo, di cui uno è il timestamp.
+
+In letteratura vi è una serie di architetture e modelli preconfezionati che possano aiutarci a raggiungere il nostro scopo, ma prima conviene analizzarne i componenti alla base per capire bene dove concentrarsi nello sviluppo.
+
+\subsection{Caso 1 -- CNN-1D}
+
+\subsubsection{Introduzione}
+
+Per iniziare, si è scelto di indagare l’effettiva utilità delle CNN nel nostro caso, vista la presenza abbondante in letteratura di progetti simili che integrano in toto o in parte le reti neurali convoluzionali. 
+Avendo una serie multivariata, e non essendo quindi in presenza di immagini, risulta ovvia l’eventuale applicazione di CNN monodimensionale (da qui 1-D) anziché le classiche a più dimensioni. In breve, la rete in esame funziona come in seguito:
+
+
+\begin{itemize}
+    \item Utilizza una finestra* lunga 256 campioni, ognuno dei quali corrisponde a una variabile nel tempo. In particolare, questa finestra contiene una di queste variabili campionata ogni secondo fino quindi ad arrivare a 256s (4m 16s). Considerando che le variabili sono 20, è logico dedurre che il contenuto della finestra è di 256x20 (tensore di input).
+    \item L’intervallo temporale di circa 4m ci assicura la copertura di un intero ciclo macchina, e aggiungendo un overlap del 50\% (sovrapposizione di metà finestra ad ogni iterazione) siamo sicuri di non perdere eventuali informazioni lungo i bordi.
+    \item Parlando di memoria, si noti che ogni valore è float32 in allenamento, mentre a miniaturizzazione avvenuta sarà int8. Inoltre abbiamo 7 620 113 secondi di dati che, considerando l’overlap (nuova finestra ogni 128s) ci indica 59530 finestre da 20Kb circa ogni epoca.
+    \item Il tipico schema di una CNN-1D è quello che permette una facile compressione della finestra in un bottleneck (encoder) e cercando di ricostruirla fedelmente (decoder). In inferenza, se questo tentativo fallisce, si ha la cosiddetta anomalia.
+\end{itemize}
+
+\subsubsection{Training}
+
+Vengono inserite 64 finestre alla volta (regola TensorFlow) in pasto ai Layer. Vi sarà una ‘lente’ che scorre 3s (campioni) sul blocco da 256s facendo operazioni sulle loro 20 variabili. Terminate tutte le finestre in ingresso si continua con le successive e, su NVIDIA L40s disponibili presso IFAB, è questione di pochi minuti prima di terminare. Si considera solitamente un 90\% training e 10\% validation in Anomaly Detection.
+
+\subsubsection{Miniaturizzazione}
+
+L’occupazione della memoria FLASH (non volatile) è quindi composta da (ipotizzando con i nostri dati):
+\begin{itemize}
+    \item Pesi: 2 952 byte $\approx$ 2.9 kB di pesi --> Peso puro della rete
+    \item Metadati: 1,5kB
+    \item Firmware-Kernel: 5kB
+\end{itemize}
+Con somma pari a 10k.
+Discorso simile per la RAM (volatile) composta da:
+\begin{itemize}
+    \item Input finestra: 5kB (256x20x 1B di dato)
+    \item Arena: 8kB (buffer intermedio TensorFlow)
+    \item Variabili di appoggio: 2kB
+\end{itemize}
+Con somma pari a 15kB. Sapendo infine che un microcontrollore classico presente in letteratura è il seguente:
+\begin{center}
+    STM32F411 ARM M4 100 MHz Flash 128 kB Ram 64 kB
+\end{center}
+L’architettura risulta pienamente compatibile.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{c l l r r}
+\toprule
+\# & Layer (in$\to$out, k)        & Params (3*in*out + bias) & Peso & Spazio int8 [B] \\
+\midrule
+1 & Conv1D + ReLU (20 $\to$ 16,3) & 3*20*16 + 16 & 976 & 976 \\
+2 & Conv1D + ReLU (16 $\to$ 8, 3)  & 3*16*8 + 8   & 392 & 392 \\
+3 & Conv1D + ReLU (8 $\to$ 4, 3)   & 3*8*4 + 4    & 100 & 100 \\
+4 & Conv1D + ReLU (4 $\to$ 8, 3)   & 3*4*8 + 8    & 104 & 104 \\
+5 & Conv1D + ReLU (8 $\to$ 16, 3)  & 3*8*16 + 16  & 400 & 400 \\
+6 & Conv1D (linear) (16 $\to$ 20, 3) & 3*16*20 + 20 & 980 & 980 \\
+\midrule
+\multicolumn{3}{r}{\textbf{Totale parametri}} & \textbf{2952 B} & \textbf{2952 B} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Problemi}
+
+Il primo problema riguarda l’impostazione automatica dei frameworks di CNNs, ovvero la doppia sommatoria che considera sia la variazione dal normale di ogni singolo campione (pesato sul totale) sia quella nel tempo. Di conseguenza, se un solo valore cambia rispetto agli altri, il peso di quest’ultima variazione viene \textbf{diluito}, soprattutto nei casi di spike (picchi di pochi secondi). A noi serve poter individuare anche un singolo valore anomalo o, in ogni caso, considerare gruppi di valori tra loro correlati.
+
+Un secondo problema più rilevante è dovuto all’architettura stessa delle reti neurali convoluzionali. Esse hanno una finestra che rileva, certamente, un intero ciclo macchina. Nel caso però di una o piu variabili che vanno alla deriva durante la giornata (lentamente, ma in modo costante) la CNN per sua natura non è in grado di leggere questo ‘drift’. È progettata solo per picchi. Conseguentemente, la rete si comporterebbe quasi(**) come un if-else e, solo quando la variabile esce completamente dalla soglia consentita, è in grado di riconoscerla come anomalia. Ma è troppo tardi.
+
+Consideriamo dunque questo semplice esempio:
+Un sensore viene considerato in \textbf{normali condizioni} operative se rileva temperature intorno ai 42°C. La soglia, fissata a 50°, indica la presenza di un problema. Ipotizzando un aumento di temperatura ogni 30min (ben fuori dalla finestra+overlap) si arriverebbe all’allarme solo al raggiungimento dei 50°C. 
+
+Infine, l’architettura deve poter essere resistente ai glitch: vi sono casi in cui un picco deve non essere segnalato in quanto potrebbe non trattarsi di un’anomalia (con le dovute precauzioni).
+Si vede dunque necessario poter implementare una rete in grado di memorizzare lo stato più a lungo termine.
+
+\subsubsection{Note}
+*Viene chiamata finestra nonostante sia a tutti gli effetti un vettore di 20 variabili anziché una matrice
+
+**Dico ‘quasi’ poiché comunque uno spike di qualche secondo verrebbe segnalato come da definizione.
+
+\subsection{Caso 2 -- LSTM}
+
+\subsubsection{Introduzione}
+
+Una rete LSTM (tipicamente nella sua versione più diffusa in anomaly detection, LSTM32Byte) funziona nel modo seguente:
+\begin{itemize}
+    \item Possiede uno stato di 64B (32 + 32 hidden) che riassume gli ‘avvenimenti’ precedenti
+    \item Prende in ingresso il primo ‘dato’ e viene scritto in quei 64B
+    \item Il dato successivo, diverso o uguale, arriva in ingresso. In quei 64B verrà annotato che per due iterazioni è arrivato in ingresso un dato uguale o diverso.
+\end{itemize}
+Così via, per le successive iterazioni. Chiaro dunque che l’informazione contenuta in quei 64B è un riassunto di quello che è successo e non una sovrascrittura/variazione rispetto alla precedente, si può procedere a fare alcune valutazioni.
+
+\subsubsection{Considerazioni e problemi}
+
+In primis, l’LSTM32 è in grado di trovare derive di componenti anche per 1 o 2 giorni (più componenti subiscono drift, e prima si satura il buffer di stato). Inoltre, questa rete è in grado di ricordare per molto tempo eventuali eventi successi, anche di pochi secondi. Questo significa che un eventuale spike può protrarsi nel buffer per qualche ora e, nel caso riavvenga per colpa di un glitch, verrebbe segnalato come anomalia.
+
+Occorre quindi ignorare questi brevi picchi a seconda della situazione. Questo è sì possibile in LSTM, ma complicato in sviluppo poiché questa rete non nasce nativamente per trattare queste situazioni. Di conseguenza, tarare ad hoc i parametri può risultare dispendioso in termini di tempo per trovare il set adatto.
+
+La soluzione al nostro caso di studio converge verso l’utilizzo combinato di queste tecnologie contrapposte che, se suddivise nei loro compiti, possono adattarsi a una molteplicità di scenari, tra cui il nostro.
+
+\subsection{Caso 3 -- LSTM + CNN-1D}
+
+\subsubsection{Introduzione}
+
+Il funzionamento di questa pipeline si basa su CNN che, dopo aver dato l’output di ricostruzione, esso viene inserito in input dell’LSTM. In questo modo, la rete è in grado di memorizzare [\textit{riassunti}] finestre fino a 2 giorni. Riconosce inoltre facilmente gli spike e, se generati da certe variabili o gruppi di queste, può decidere di ignorarli. Bisogna ora considerare quante risorse in piu si renderanno necessarie. Come vedremo, saranno quasi trascurabili.
+
+\subsubsection{Miniaturizzazione e confronti con CNN-Solo}
+
+Vediamo dunque quanto effettivamente occupano i pesi della rete CNN+LSTM
+
+\begin{table}[h]
+\centering
+\begin{tabular}{l l l l}
+\toprule
+Blocco & Config              & Parametri & Spazio int8 \\
+\midrule
+CNN (encoder+decoder) & calcolato prima & --     & 2.952 B \\
+LSTM                   & d=16, h=32      & 6.272 & 6.272 B \\
+Dense (h$\to$d)        & 32$\to$16       & 528   & 528 B   \\
+\midrule
+Totale pesi rete       & --              & --     & 9.752 B $\sim$ 9,5 kB \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Quindi confrontando Flash e RAM si ha un leggero aumento:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{l l l l}
+\toprule
+Voce & CNN-solo (...) & CNN+LSTM (....) & Surplus \\
+\midrule
+Pesi rete          & $\sim$2,9 kB      & $\sim$9,5--9,9 kB & +6,6--7,0 kB \\
+Metadati modello   & $\sim$1,5 kB      & $\sim$1,5 kB      & $\sim$0      \\
+Firmware/Kernel TFL-Micro* & $\sim$5 kB & $\sim$7--9 kB     & +2,4 kB      \\
+\midrule
+Totale FLASH       & $\sim$10 kB       & $\sim$19--21 kB   & +9--11 kB    \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{l l l l}
+\toprule
+Voce & CNN-solo (...) & CNN+LSTM (....) & Surplus \\
+\midrule
+Input finestra (256x20xint8)          & $\sim$5,0 kB  & $\sim$5,0 kB        & $\sim$0        \\
+Arena TFLM                             & $\sim$8 kB    & $\sim$9--10 kB      & +1--2 kB       \\
+Varie/appoggio                         & $\sim$2 kB    & $\sim$2 kB          & $\sim$0        \\
+Stato LSTM (h=32: h\_t, c\_t)          & --            & $\sim$0,1--0,3 kB   & +0,1--0,3 kB   \\
+Anti-glitch buffer & --      & $\sim$1,2 kB        & +1,2 kB        \\
+\midrule
+Totale RAM                             & $\sim$15 kB   & $\sim$17--18 kB     & +2--3 kB       \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Come si può evincere dalle tabelle, l’aumento non è significativo in un STM32F411. Si fa riferimento alla rete miniaturizzata e quindi esportata in formato .tflite
+
+Occorre precisare un’ultimo parametro, ovvero il \textit{‘peso’ computazionale} in inferenza di CNN+LSTM. Ogni secondo, la CNN prende in input 20 variabili, le quali attraversano 6 layers $\rightarrow$ circa 3k MAC* al secondo (vedi tabella precedente). Dopo 128s (overlap) la finestra va in ingresso all’LSTM che farà c.a 6k MAC [ogni 128s $\rightarrow$ quasi trascurabile]. Nella peggiore delle ipotesi di 4/5k MAC/s si rimane comunque intorno ai \textbf{100M MAC/s} disponibili con una CPU 100Mhz del microcontrollore in esame.
+
+Un’ultima informazione importante riguarda l’output della rete, composta dai \textbf{residui} di ogni canale (indice di diversità) per quanto riguarda la CNN intermedia. L’output vero e proprio LSTM è invececomposto da score drift (punteggio di deriva totale), OK/WARN/ALARM flags e topcause[3] (i 3 canali che hanno contribuito di più nell’anomalia.
+
+\subsubsection{Note}
+*Moltiplicazioni-somma alla base della rete neurale
+
+\section{Sezione 2 -- Ipotesi sui dati e raggruppamenti}
+
+Il nostro progetto prevede un dataset con 20 variabili di input ed essendo derivanti da una stessa macchina. È ragionevole pensare che vi siano una serie di \textbf{correlazioni} tra essi e che, in allenamento/inferenza, queste somiglianze debbano essere prese in seria considerazione. Si vuole infatti evitare il più possibile l’incontro di falsi allarmi e, soprattutto, il mancato riconoscimento di pattern pericolosi. Il raggruppamento è possibile tramite una regola di Tensorflow
+
+\subsection{Raggruppamenti ipotetici}
+
+\subsubsection{Gruppo A [Processo]}
+
+m1\_p4\_current (I assorbimento),\\
+system1\_p0\_payload (Portata)\\
+system1\_p1\_temp (Temp uscita)\\
+m1\_p4\_status (ON/OFF)
+
+Queste variabili rappresentano probabilmente le condizioni operative del carico termico e meccanico, in altre parole lo stress della macchina. 
+
+Considerando macchine di caratteristiche simili \textit{(quindi senza aver ancora guardato i dati precisamente)} se la temperatura sale è spesso dovuto a un incremento di corrente. Se invece la temperatura scende, può essere colpa della diluizione di carico (Payload è salito). Da notare che la temperatura solitamente reagisce dopo 2/3 finestre (10/15 min). Se invece la temperatura non segue l’andamento di I o di P, può essere indice di anomalia.
+
+Infine, un elemento da considerare è lo status: variazioni critiche di corrente, payload e temperature in fase di spegnimento sono da considerarsi regolari.
+
+\subsubsection{Gruppo B [Indicatori meccanici]}
+
+temp\\
+acc\_rms\\
+kurt\\
+cfa (crest factor)\\
+skew\\
+max / min,\\
+Std
+
+Tramite questi indicatori è possibile individuare \textit{pattern fisici}. Un esempio può essere il gioco meccanico (difetto): Se l’accelerometro RMS e la STD aumentano con max e min che hanno dei picchi, vi è rispettivamente molta energia vibratoria, grandi oscillazioni e urti lungo (ad esempio) un bordo macchina.
+
+\subsubsection{Gruppo C [Incroci]}
+
+Più \textit{difficili} da individuare, serve una conoscenza approfondita sui dati. Un ipotetico caso è l’overload (RMS alto insieme alla corrente).
+
+\section{Sezione 3 -- Nucleo-F411RE (MCU)}
+
+Per lo sviluppo del modello richiesto, si rende necessario un microcontrollore che possa aiutare il debug delle varie versioni di prova. Il modello più utilizzato in letteratura è il seguente:
+\begin{center}
+    Nucleo-F411RE
+\end{center}
+Si tratta della versione STM32F411 con più Flash e Ram, adatta soprattutto allo sviluppo. È presente un connettore Micro-USB per collegarlo al PC e dunque al pratico IDE denominato STM32CubeIDE. Viene quindi creato il progetto e caricato il modello .tflite all’interno dell’IDE che ne facilita la compilazione e adattamento con i comandi specifici. A progetto funzionante, si preferirà l’utilizzo del piu piccolo e performante F411CEU6 ‘Black Pill’ o equivalente.
+
+\subsection{Introduzione}
+
+Innanzitutto, è possibile scaricare l'IDE dal sito ufficiale, e l'installazione è piuttosto semplice su macchine Linux debian-based. È sufficiente eseguire l'installer .sh con permessi di sudo e, per ora, negare l'installazione dei plugin per boards non-Nucleo.
+
+A questo punto, creiamo un nuovo progetto: File $\rightarrow$ New $\rightarrow$ STM32 Project. Poi, cliccare sulla tab Board Selector $\rightarrow$ Nucleo-F411RE + next $\rightarrow$ lasciare HAL come libreria, Toolchain/IDE = STM32CubeIDE $\rightarrow$ Finish
+
+Vi sarà un avviso indicante che il pacchetto firmware per la serie F411x non è installato. Saremo quindi costretti a creare un account su STM e, fatto ciò, nel progetto Help $\rightarrow$ Updates $\rightarrow$ Connection to myST
+
+A questo punto, sempre su Help $\rightarrow$ Conf tools $\rightarrow$ Manage … $\rightarrow$ STM32Cube MCU Package for STM32F4 Series (STM32CubeF4). $\rightarrow$ Install {~ 1 Gb}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{l l l l}
+    oprule
+Package & Installed version & Available version & Size \\
+\midrule
+MCU Package for STM32F4 Series & 1.28.3 & 1.28.3 & -- \\
+MCU Package for STM32F4 Series & --     & 1.28.2 & 925.0 MB \\
+MCU Package for STM32F4 Series & --     & 1.28.1 & 895.0 MB \\
+\bottomrule
+\end{tabular}
+\caption{STM32Cube MCU Packages (estratto)}
+\end{table}
+
+\subsection{Uno sguardo rapido all’architettura}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+    pinlabel/.style={font=\small},
+    >=stealth
+]
+\node[draw, rounded corners, minimum width=7cm, minimum height=4cm, align=center] (mcu)
+    {STM32F411RE};
+
+% Lato sinistro
+\node[pinlabel, anchor=east] (pa5)  at ([xshift=-0.7cm,yshift=0.7cm]mcu.west) {PA5 / LD2};
+\node[pinlabel, anchor=east] (pa2)  at ([xshift=-0.7cm,yshift=-0.1cm]mcu.west) {PA2 / USART\_TX};
+\node[pinlabel, anchor=east] (pa3)  at ([xshift=-0.7cm,yshift=-0.9cm]mcu.west) {PA3 / USART\_RX};
+
+\draw (pa5.east) -- ([xshift=-0.1cm]mcu.west |- pa5.east);
+\draw (pa2.east) -- ([xshift=-0.1cm]mcu.west |- pa2.east);
+\draw (pa3.east) -- ([xshift=-0.1cm]mcu.west |- pa3.east);
+
+% Lato destro
+\node[pinlabel, anchor=west] (pa13) at ([xshift=0.7cm,yshift=0.7cm]mcu.east) {PA13 / TMS};
+\node[pinlabel, anchor=west] (pb3)  at ([xshift=0.7cm,yshift=-0.1cm]mcu.east) {PB3 / SWO};
+\node[pinlabel, anchor=west] (vdd)  at ([xshift=0.7cm,yshift=-0.9cm]mcu.east) {VDD / VSS};
+
+\draw ([xshift=0.1cm]mcu.east |- pa13.west) -- (pa13.west);
+\draw ([xshift=0.1cm]mcu.east |- pb3.west)  -- (pb3.west);
+\draw ([xshift=0.1cm]mcu.east |- vdd.west)  -- (vdd.west);
+\end{tikzpicture}
+\end{figure}
+
+La board possiede un microcontrollore principale con CPU, RAM e memoria FLASH. Inoltre su di esso sono disponibili vari bus, tra cui
+\begin{itemize}
+    \item $I^2C$: Bus a 2 fili (SCL clock, SDA dati) su cui piu sensori possono essere collegati e ognuno ha un indirizzo. Es. la CPU chiede a sensore 0x68 6 byte a partire da 0x00 $\rightarrow$ vengono passati in SDA a ritmo SCL.
+    \item UART: due fili molto più semplici (TX invio, RX ricezione), usato per log/test tra PC e Board in debug. La CPU bufferizza in RAM interna ogni dato che arriva su RX. Naturalmente asincrono, può anche essere impostato sincrono (USART).
+\end{itemize}
+Inoltre va ricordata l’interfaccia \textbf{NVIC} all’interno della CPU che gestisce gli interrupts in arrivo (ad esempio da GPIO) e delega le callback specifiche per la sua gestione.
+
+Oltre al chip primario, è presente un secondario \textbf{ST-LINK} più piccolo, vicino al connettore micro-USB, che funge da ponte con il PC e la Board. Possiede un convertire chiamato Virtual COM per rendere possibile la comunicazione USB – USART e quindi fondamentale per connettere PC e scheda. Questo chip viene utilizzato per programmare il firmware dentro al primario e per i vari debug (pause, breakpoints, lookup variabili in CubeIDE). Esempio di funzionamento:
+\begin{itemize}
+    \item Programmazione: quando voglio caricare il file compilato da PC sul chip F411, esso viene prima inviato a ST-LINK che tramite un’interfaccia seriale apposita SWD (Non quella USART) scrive quei byte in FLASH del microcontrollore principale tramite due pin appositi. Si occuperà quest’ultimo dell’esecuzione.
+    \item Debug: la stessa interfaccia SWD viene utilizzata per fermare l’esecuzione, mettere breakpoints o leggere registri/RAM $\rightarrow$ pieno controllo
+    \item Log: tramite il bridge Virtual COM, come detto prima, permette la comunicazione tramite TX/RX. In particolare, ogni printf() sul codice viene scritta su TX e ricevuta quindi dal PC tramite COM.
+\end{itemize}
+
+\subsubsection{Qualche prova}
+L’interfaccia iniziale è quella del file ‘\textit{progettista}’ (.ioc). La prima azione da svolgere è quella di attivare i bus sopra menzionati: Connectivity $\rightarrow$ I2C1 $\rightarrow$ $I^2C$ 
+
+A questo punto si illumineranno i pin della CPU di verde (possono essere cambiati volendo). In ogni caso dalla schermata in basso dei ‘Parameter Settings’ conviene attivare la Fast Mode in Master Features. 
+
+Ora invece attiveremo \textbf{UART} (di default solitamente) lasciando quindi async al posto di sync e lasciando la configurazione 115200 bit/s 8 bit/words 1 Stop bit (ogni word finisce con un bit a 1). Questo è lo standard di qualsiasi terminale seriale richiesto di default per una comunicazione con PC. 
+
+Non ci resta che \textit{scandire il tempo} di campionamento pari a 1Hz: Timers $\rightarrow$ TIM2 $\rightarrow$ ‘Clock Source’ = Internal Clock. Ora è necessario aprire il tab Clock configuration, che esporrà tutti i clock di ogni parte della board (es. Ethernet, Cortex, Periferiche…). Quello che ci interessa è APB1 e APB1x2, le strade più lente per le periferiche, che presentano prescaler per dividere il clock (depotenziarlo). Per questo motivo, bisogna annotarsi i due valore di APB1, tornare su Pinout configuration e configurare Prescaler-CounterPeriod seguento la \textit{formula}: 
+
+\begin{equation}
+f_{\text{update}} = \frac{f_{\mathrm{TIMxCLK}}}{(PSC + 1)\,(ARR + 1)} \, .
+\end{equation}
+
+Dal momento che il clock su APB1 vale 42Mhz, metteremo prescaler pari a 8399 e Counter Period 9999 (entrambi con il -1 dovuto al +1 della formula. Useremo dunque TIM2 come timer per il nostro modello. Spuntare inoltre ‘enabled’ in NVIC Settings per consentire al timer di mandare un \textbf{interrupt} ad ogni Hz alla CPU via NVIC. 
+
+\begin{table}[h]
+\centering
+\begin{tabular}{l l}
+\toprule
+Impostazione          & Valore \\
+\midrule
+Prescaler (PSC - 1)   & 8399 \\
+Counter Mode          & Up \\
+Counter Period (ARR)  & 9999 \\
+Internal Clock Division & No Division \\
+Auto-reload preload   & Disable \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{l c c}
+\toprule
+Interrupt           & Enabled & Preemption Priority \\
+\midrule
+TIM2 global interrupt & \checkmark & 0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Organizzazione del file main.c }
+
+Innanzitutto si ha una suddivisione del file in 3 parti principali:
+\begin{itemize}
+    \item Operazioni preliminari: includes, static functions e variabili globali.
+    \item Main: Inizializza le principali funzionalità, tra cui HAL, Clock e nel nostro caso deve avviare il Timer (pronto per interrupt). Infine, prosegue con un while(1) loop che include la logica da seguire durante il lavoro.
+    \item Callbacks e altro: Qui si creano timer ed eventuali funzioni di reindirizzamento Hardware. Ad esempio, estenderemo una callback di sistema che viene chiamata ad ogni Interrupt NVIC del timer e, mediante selezione specifica per quel timer, faremo un Toggle.
+\end{itemize}
+
+\subsection{Progetto di prova 1 -- Led a 1Hz}
+
+Per prima cosa andare su Pinout-Configuration $\rightarrow$ Cliccare pin Pa5(LED) $\rightarrow$ Seleziona GPIO\_Output $\rightarrow$ facendo un \textit{toggle}, esso alternerà a 1Hz se tutto è corretto. 
+Durante il salvataggio del progetto o chiusura, l’IDE chiederà se si vuole \textbf{generare} il codice associato. Rispondere sì o, altrimenti, generarlo in un secondo momento: Project $\rightarrow$ Generate Code (icona ingranaggio). Ora aprire Core/Src/main.c $\rightarrow$ vi saranno tutti i moduli che vengono inizializzati, tra cui:
+
+
+\begin{verbatim}
+MX_GPIO_Init();
+MX_USART2_UART_Init();
+MX_I2C1_Init();
+MX_TIM2_Init();
+\end{verbatim}
+
+Notiamo che ciò di cui abbiamo parlato fino ad ora viene inizializzato; tuttavia, il TIM2 (timer) non parte da solo: necessita di una funzione di start da inserire subito dopo:
+
+\begin{verbatim}
+HAL_TIM_Base_Start_IT(&htim2);
+\end{verbatim}
+
+A questo punto, ad ogni scatto viene chiamata la sua callback. Fuori dal main, la callback dovrà essere così composta:
+
+\begin{lstlisting}[language=C]
+/* USER CODE BEGIN 4 */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+    if (htim->Instance == TIM2) {
+        HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);  // LED blink
+        printf("tick\r\n");                     // messaggio su Virtual COM
+    }
+}
+/* USER CODE END 4 */
+\end{lstlisting}
+
+Mi aspetterò dunque un toggle ogni secondo e un printf su PC (tramite Virtual COM) che scrive `tick`. 
+
+Si aggiunge quindi un'estensione a basso livello subito prima della callback. Normalmente, in un PC la printf() viene mandata sul terminale di default. Qui purtroppo non è cosi semplice: STM32 non ha un vero terminale virtuale, e nessun OS. Ricordando che in C (Linux): 
+printf chiama la systemcall write() --> trap di sistema --> kernel --> terminale. Noi dovremo simulare lo stesso comportamento. Qui, la printf chiama \_write() che chiama \_\_io\_putchar, che andrà estesa per scrivere su UART/USART Attivato precedentemente.
+
+% __io_putchar con USART2
+\begin{lstlisting}[language=C]
+int __io_putchar(int ch) {
+    HAL_UART_Transmit(&huart2, (uint8_t *)&ch, 1, 10);
+    return ch;
+}
+\end{lstlisting}
+
+\subsubsection{Nota molto importante}
+
+In questo primo progetto di prova le ottimizzazioni non sono l'argomento principale, si ragiona da un punto di vista puramente \textit{didattico}. Nella realtà, bisogna stare molto attenti alle operazioni di printf e, più in generale, al lato hardware.
+In particolare, quando viene chiamata la callback, non bisognerebbe \textbf{mai} scrivere una printf al suo interno. questo poichè gli interrupt bloccano per definizione gli altri interrupt di stesso livello o superiore, e quindi con un'operazione piu o meno lunga (es. printf) rischia di \textit{perdersi altri interrupt} urgenti o dati in arrivo. Per questo motivo, conviene:
+
+\begin{itemize}
+    \item Evitare la stampa dentro alla callback aggiungendo solamente un aggiornamento di flag.
+    \item Nel while(1) del main, stampare ogni volta che il flag cambia e poi ri-inizializzarlo.
+\end{itemize}
+
+In questo modo, la CPU si interrompe per pochissimo e, nonostante finisca i compiti di interrupt handling, rimane in ascolto.
+Nel nostro caso, una soluzione possibile potrebbe quindi essere dichiarare il tick flag (sempre nella sezione 4, sopra ad \_\_io\_putchar):
+
+\begin{verbatim}
+volatile uint8_t tick_flag = 0;
+\end{verbatim}
+
+Poi cambiare la funzione di Callback:
+
+\begin{lstlisting}[language=C]
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+    if (htim->Instance == TIM2) {
+        HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);  // LED blink
+        tick_flag = 1;                          // segnale
+    }
+}
+\end{lstlisting}
+
+Infine, modificare il while(1) del main per la gestione della print (o altre f):
+
+\begin{lstlisting}[language=C]
+/* USER CODE BEGIN WHILE */
+while (1)
+{
+    /* USER CODE BEGIN 3 */
+    if (tick_flag) {
+        tick_flag = 0;
+        printf("tick\r\n");
+    }
+    /* USER CODE END 3 */
+}
+/* USER CODE END WHILE */
+\end{lstlisting}
+
+Detto questo, resta il fatto che stiamo utilizzando un modello AI e non siamo obbligati al vincolo hard-realtime: la latenza puo essere \textit{tollerata}.
+
+\section{Sezione 4 -- Nucleo-U545RE (MCU)}
+
+Per motivi sperimentali, si è scelto di sospendere lo sviluppo sulla tanto usata quanto semplice F411RE per spostarsi verso un MCU Più all'avanguardia: la serie U infatti, sono boards molto più recenti: Ne è testimone la poca documentazione disponibile e, soprattutto, l'interfaccia nell'IDE (molto più rudimentale). Vediamo alcune caratteristiche chiave della
+Nucleo-U545RE
+\begin{itemize}
+    \item Cortex-M33 a 160 MHz: più veloce rispetto ai 100MHz precedenti
+    \item Flash 2MB, RAM 786KB. Entrambi 4 volte rispetto al F411RE
+    \item Nuove connettività: USB C (doppio, uno anche per il caricamento diretto senza STLINK), I3C, Timer avanzati per sensori moderni, ...
+    \item Consumi ridotti: Il processore è a 40nm anzichè 90, transistor quindi più piccoli e veloci con meno disspazione di energia a parità di frequenza.
+\end{itemize}
+
+Infine, la serie U5 è specificamente progettata per il consumo minimo indispensabile: oltre alle classiche run/sleep/stanby sono disponibili altre modalità di \textit{risparmio energetico}. Vi è anche una sorgente di clock Multi Speed Internal Oscillator MSIS che è specificaatamente progettata per funzionare in ultra low power.
+
+\subsection{Nota importante}
+
+Nota importante: l'architettura generale della board rimane la stessa: 
+\begin{itemize}
+    \item Doppio MCU (vero + debug)
+    \item Logica dei timer,
+    \item Interrupt-handler NVIC
+    \item Clock configuration
+\end{itemize}
+Bisognerà prestare attenzione: come accennato prima, la board è molto recente e non è disponibile la standard view ma solo la MCU view. Non vi sono funzionalità in meno, ma semplicemente la visualizzazione risulta più 'brutale'. Di fatti, è solo un elenco.
+
+A questo punto, ne proveremo il funzionamento basilare come nell'altra mediante la prova di \textit{interrupt / handlers} di accensione e spegnimento led a una certa frequenza scelta da noi. Faremo nuovamente riferimento alla guida ufficiale.
+
+\subsection{Setup iniziale}
+
+Impostare il clock \textit{alto} giusto per prendere familiarità con lo schema delle sorgenti interne.
+
+Partendo da sinistra, osserviamo che ci sono 2 tipi di sorgenti che ci interessano: HSI-RC e MSIS. Essi finiscono verso destra nel System Clock Multiplexer. Di default, questo Mux seleziona \textbf{MSIS}. Noi vogliamo HSI-RC (che parte da 16MHz, ma ha a disposizione divisori e moltiplicatori per aggiustarlo esattamente al nostro bisogno, a differenza di MSIS, difficilmente pilotabile).
+
+Impostiamo quindi Mux a \textbf{PLLCLK} (arriva da HSI, da selezionare il PLL1 Source Multiplexer) e tariamo i corrispondenti M/D per arrivare a \textbf{160MHz} utilizzando semplice ragionamento \textit{logico}. Assicuriamoci infine che le uscite APB di periferiche siano anch’esse a 160MHz.
+
+Siamo così pronti a procedere con la creazione del timer + interrupt handler, proseguendo con il nostro progetto di prova. Ovviamente, se il clock va in overflow (CLK massimo consentito 160MHz) viene mostrato un errore in viola.
+
+
+\subsection{Interrupt handling su LED toggle}
+
+\subsubsection{Introduzione}
+Il procedimento è \textit{simile} a quello svolto per F411, tuttavia la schermata iniziale può risultare un po controintuitiva. Valgono le stesse precisazioni in merito a ottimizzazione con flag fatte per F411RE. Anche qui, il LED è collegato a PA5, che sarà da impostare come GenPurposeIO Output e nei params dovrà essere scritto \textbf{MANUALMENTE LD2} come user output dalla schermata GPIO del System Core. In questo modo, lato codice verrà generato LD2\_Pin e LD2\_GPIO\_Port su cui posso usare la 'primitiva' toggle(LD2\_Pin,LD2\_GPIO\_Port).
+
+\subsubsection{Menu di GPIO}
+Per attivarlo tramite interrupt, imposto come in F411 un timer. Userò un prescaling 15999, counterPeriod 599 per un flashing rapido del LED. A questo punto non ci resta di impostare la callback timer che discrimina per TIM2 e cambia il flag, e nel while true il solito if con primitiva + cambio flag. Funzionerà correttamente. 
+
+\[
+f_{\text{update}} = \frac{f_{\mathrm{TIMxCLK}}}{(PSC + 1)\,(ARR + 1)}
+\]
+
+\begin{table}[h]
+\centering
+\begin{tabular}{l l}
+Impostazione & Valore \\
+\midrule
+Prescaler (PSC - 1) & 8399 \\
+Counter Mode & Up \\
+Counter Period (ARR) & 9999 \\
+Internal Clock Division & No Division \\
+Auto-reload preload & Disable \\
+\bottomrule
+\end{tabular}
+\caption{TIM2 - Parameter Settings}
+\end{table}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{l c c}
+    oprule
+Interrupt & Enabled & Preemption Priority \\
+\midrule
+TIM2 global interrupt & \checkmark & 0 \\
+\bottomrule
+\end{tabular}
+\caption{NVIC settings TIM2}
+\end{table}
+
+\subsubsection{Reindirizzamento printf in porta seriale}
+Come già mostrato per F411, anche qui vogliamo prendere confidenza con la USART della board in modo da avere un'uscita \textbf{seriale} verso il nostro PC da STLINK e poter vedere printf di debug. Si deve quindi attivare USART1 in modalità \textit{asincrona}, rigenerare il \textit{codice}, importare la \textit{libreria}:
+\begin{verbatim}
+#include <stdio.h>
+\end{verbatim}
+Inserire dunque printf("tick\r\n") nel whileTrue e, subito topo la \textit{callback}, nello user code space inserire:
+\begin{lstlisting}[language=C]
+int __io_putchar(int ch) {
+    HAL_UART_Transmit(&huart1, (uint8_t *)&ch, 1, HAL_MAX_DELAY);
+    return ch;
+}
+
+int _write(int file, char *ptr, int len) {
+    HAL_UART_Transmit(&huart1, (uint8_t *)ptr, len, HAL_MAX_DELAY);
+    return len;
+}
+\end{lstlisting}
+
+% =========================
+\subsubsection{Visualizzazione seriale Virtual COM}
+A questo punto è tutto pronto: basta solo riuscire a visualizzare l'output \textbf{seriale} sul proprio PC. Installare il programma \textit{screen}:
+\begin{verbatim}
+sudo apt install screen
+\end{verbatim}
+Ricercare il dev file associato (tipicamente driver ACM):
+\begin{verbatim}
+sudo dmesg | grep tty
+\end{verbatim}
+Visualizzare il terminale (stamperà 'tick' ogni N ms):
+\begin{verbatim}
+screen /dev/ttyACM0 115200
+\end{verbatim}
+
+Per uscire: Ctrl+A -> \textbackslash{} -> Y. 
+
+% dmesg: riconoscimento del device ttyACM0
+\begin{lstlisting}[language=bash]
+[344455.760043] cdc_acm 3-1.4:1.2: ttyACM0: USB ACM device
+[350968.094608] cdc_acm 3-1.4:1.2: ttyACM0: USB ACM device
+\end{lstlisting}
+
+
+% Output della seriale con i tick
+\begin{lstlisting}[language=bash]
+tick
+tick
+tick
+tick
+tick
+tick
+tick
+tick
+tick
+tick
+...
+\end{lstlisting}
+
+\subsubsection{Note}
+Il numero 115200 è il baud di default lasciato su USART1.
+
+\subsection{Prova di import di modello CNN-Solo}
+Innanzitutto, in realtà \textbf{il plugin di visualizzazione della board è disponibile.} L'importante è scegliere l'unico con la voce board tra quelli che presentano la stessa sigla \textbf{U545RE}.
+
+Si procede dunque a un progetto di prova in cui si cercherà di \textit{importare un modello} (solo CNN, per ora) dentro al MCU. Vi saranno alcuni step non del tutto corretti inizialmente, e per questo motivo si noti che la guida segue i \textit{numerosi tentativi} e non è riscritta solo sulla base delle parti funzionanti
+
+\subsubsection{Conversione con quantizzazione a 8 bit}
+In questo progetto di prova, prenderemo confidenza con la conversione di un modello in TensorflowLiteMicro, per poi importarlo con tutti i tool necessari per un funzionamento ottimale. Occorre precisare che, per ora, non abbiamo ancora scelto un modello da utilizzare \textit{di default}. Dunque, sarà usato un semplice modello CNN di prova sui dati campionati (No LSTM) convertito tramite \textit{TFlite Micro}.
+
+% Script Python per quantizzazione int8
+\begin{lstlisting}[language=Python]
+import tensorflow as tf
+import numpy as np
+
+# 1. Carica il modello h5 (senza ricompilare, serve solo per inferenza)
+model = tf.keras.models.load_model("cnn_model_no_clipnorm.h5", compile=False)
+
+# 2. Dataset rappresentativo per calibrare la quantizzazione
+def representative_dataset():
+    for _ in range(100):
+        # Shape corretta: (1, 30, 19) -> [batch=1, timesteps=30, features=19]
+        sample_input = np.random.rand(1, 30, 19).astype(np.float32)
+        yield [sample_input]
+
+# 3. Converter configurato per int8
+converter = tf.lite.TFLiteConverter.from_keras_model(model)
+converter.optimizations = [tf.lite.Optimize.DEFAULT]
+converter.representative_dataset = representative_dataset
+converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+converter.inference_input_type = tf.int8
+converter.inference_output_type = tf.int8
+
+# 4. Conversione
+tflite_quant_model = converter.convert()
+
+# 5. Salvataggio su file
+with open("modello_int8.tflite", "wb") as f:
+    f.write(tflite_quant_model)
+\end{lstlisting}
+
+Nota: probabilmente verrà esposto un errore dovuto al training che contiene l'evaluation e altri dati. Si può \textit{ignorare} questo fatto modificando un parametro (compile=False) forzando quindi la non ricompilazione. Da notare che questo fatto può essere ignorato \textbf{se e solo se} si pensa di montare direttamente il modello per inferenza. Nel caso invece si pensa di doverlo modificare nel suo Core (es. aggiungendo/togliendo pesi in questa fase ridotta) sarà allora di vitale importanza includere il parametro per non perdersi i dati di training.
+
+\begin{center}
+    \textit{Non è il nostro caso.}
+\end{center}
+
+Finita questa operazione, non siamo ancora pronti all'export vero e proprio: di fatti, per poter essere importato nel nostro progetto occorre \textit{convertirlo in un array} unsigned char importabile come .h nel main.c. Proseguiamo quindi con il comando:
+\begin{verbatim}
+xxd -i modello_int8.tflite > modello_int8.cc
+\end{verbatim}
+Ora è tutto pronto, si passerà sull'IDE.
+
+\subsubsection{Import delle librerie necessarie}
+Naturalmente, non basta avere il modello: si rende necessario l'installazione delle \textit{librerie di Tensowrflow lite Micro} nel nostro progetto affinché il codice possa essere correttamente interpretato.
+
+Si noti la creazione della cartella Middleware per separare tensorflow da SRC.
+
+A questo punto è possibile clonare nel nostro pc, in una cartella qualsiasi, Tensorflow e Flatbuffers. sara poi necessario copiarli all'interno del progetto.
+\begin{verbatim}
+git clone https://github.com/tensorflow/tflite-micro.git
+git clone https://github.com/google/flatbuffers.git
+\end{verbatim}
+Eseguire copie (percorsi di esempio):
+\begin{verbatim}
+cp -r tflite-micro/tensorflow/lite/micro    
+<proj>/Middleware/TensorflowLiteMicro/tensorflow/lite/
+
+cp -r tflite-micro/tensorflow/lite/core 
+<proj>/Middleware/TensorflowLiteMicro/tensorflow/lite/
+
+cp -r tflite-micro/tensorflow/lite/c
+<proj>/Middleware/TensorflowLiteMicro/tensorflow/lite/
+
+cp -r tflite-micro/tensorflow/lite/schema
+<proj>/Middleware/TensorflowLiteMicro/tensorflow/lite/
+
+cp -r tflite-micro/third_party/flatbuffers/include
+<proj>/Middleware/TensorflowLiteMicro/third_party/flatbuffers/
+\end{verbatim}
+Aggiornare include path (MCU GCC Compiler -> Includes):
+\begin{verbatim}
+../Middleware/TensorflowLiteMicro/
+../Middleware/TensorflowLiteMicro/tensorflow
+../Middleware/TensorflowLiteMicro/third_party/flatbuffers/include
+\end{verbatim}
+Creare \texttt{Inc/model\_data.h}:
+\begin{verbatim}
+extern const unsigned char modello_int8_tflite[];
+extern const unsigned int  modello_int8_tflite_len;
+\end{verbatim}
+
+\subsubsection{Aggiornamento del compilatore}
+Ora che le librerie necessarie sono state aggiunte, bisogna dire al compilatore di cercarle. Tasto Dx sul progetto a sinistra $\rightarrow$ C/C++ Build $\rightarrow$ Settings $\rightarrow$ Tool Settings $\rightarrow$ MCU GCC Compiler $\rightarrow$ Includes e aggiungi queste cartelle:
+\begin{verbatim}
+../Middleware/TensorflowLiteMicro/
+../Middleware/TensorflowLiteMicro/tensorflow
+../Middleware/TensorflowLiteMicro/third_party/flatbuffers/include
+\end{verbatim}
+Dopo questa operazione:
+\begin{itemize}
+    \item Copiare modello\_int8.cc in Src
+    \item Creare Inc/model\_data.h
+\end{itemize}
+Inserire infine in model\_data.h queste due righe:
+
+\begin{verbatim}
+extern const unsigned char modello_int8_tflite[]; 
+extern const unsigned int modello_int8_tflite_len;
+\end{verbatim}
+
+\subsubsection{Compilazione}
+Fallimentare. Ci sono molti errori a cascata. Li mostreremo (brevemente) tutti.
+
+Dopo aver copiato le cartelle micro/, core/, c/, schema/ e flatbuffers/, provando la build compare l'errore:
+
+\begin{verbatim}
+    fatal error: tensorflow/lite/micro/all_ops_resolver.h: No such file or directory
+\end{verbatim}
+
+Nel clone di TFLite-Micro a quanto pare non era presente quel file, rimosso per qualche motivo nelle versioni recenti. Per risolvere, viene creato manualmente un \textit{header minimale} basato sulle versioni precedenti con la classe AllOpsResolver. 
+
+\begin{center}
+    (Codice risparmiato per motivi pratici)
+\end{center}
+
+Ora però, l'errore, più importante, è il seguente:
+
+\begin{verbatim}
+    fatal error: cstdio: No such file or directory
+\end{verbatim}
+
+Cerchiamo quindi di convertire il progetto in C++: 
+\begin{itemize}
+    \item Rinominare il main.c in main.cpp
+    \item Abilitare il compilatore C++ in CubeIDE (MCU G++ Compiler --> Dialect --> -std=gnu++14)
+    \item Aggiornare il cpp con extern C{}
+\end{itemize}
+
+\begin{center}
+    (Codice risparmiato per motivi pratici)
+\end{center}
+
+Ora però ad ogni rigenerazione del codice partendo dal file ioc, CubeIDE \textbf{rigenera} il file .c rischiando di sovrascrivere il lavoro fatto su cpp. Lasciando il main.c con chiamata su cpp, il problema è risolto.
+
+Adesso però l'errore segnala la mancanza di 'model_data.h' $\rightarrow$ creare manualmente l'header includendoci:
+
+\begin{verbatim}
+    extern const unsigned char modello_int8_tflite[]; 
+    extern const unsigned int modello_int8_tflite_len;
+\end{verbatim}
+
+Adesso l'errore è invece:
+
+\begin{verbatim}
+    fatal error: tensorflow/compiler/mlir/lite/core/c/tflite_types.h: No such file or directory
+\end{verbatim}
+
+Questi errori fanno pensare che la repo clonata:
+\begin{itemize}
+    \item Non sia quella giusta
+    \item Durante il download, qualcosa sia \textit{andato storto}
+    \item Il copincolla non sia stato fatto a dovere.
+\end{itemize}
+Si procede dunque a rifare tutto da capo, ritornando però allo stesso errore. Allora non ci resta che fare come prima: crearlo a mano.
+
+\begin{center}
+    (Codice risparmiato per motivi pratici)
+\end{center}
+
+Anche qui, altri errori di header. Si sceglie dunque di escluderli d'ora in poi, visto che in realtà non sono molto importanti. Ad esempio, quando chiede l'import di DebugLog, si crea manualmente. Il problema sono gli errori di compilazione, più importanti: mancano proprio dei moduli alla base di tensorflow (dovuti alla generale esclusione di prima). 
+È dunque ovvio che questa non sia la strada giusta. Si cercano quindi \textit{altre strade} in \textbf{letteratura}.
+
+\subsubsection{Altri 3 problemi generali}
+Il primo è di sistema: il \textbf{PC} alza al 100\% la sua CPU senza eseguire alcun task particolarmente. Indagando, si nota con htop che il processo è GZIP avviato dal logrotate (compressione dei log di sistema).
+
+Tramite \textit{du}, si nota che l'ultimo syslog è pari a 166 GB (Per niente normale!) --> GZIP cerca di comprimerlo e ovviamente carica la CPU di un lavoro intenso e \textit{prolungato}. Con \textit{awk} noto anche che i messaggi più frequenti sono quelli del BUS. Questo accende una lampadina: durante il progetto, è stato scritto '\textbf{tick}' sul terminale provando anche a velocità elevate (pochi ms) e probabilmente, lasciandolo in BG avrà creato milioni di righe. In futuro, ricordarsi di reindirizzare su file eventuali log e in ogni caso \textbf{pulirli ad ogni spegnimento}.
+
+Inoltre, CubeIDE ora sembra non rispondere correttamente ai comandi di impostazione del compilatore nei nuovi progetti, probabilmente dovuto al fatto che \textit{sono stati modificati troppi parametri} e tornare indietro è più complicato rispetto a reinstallare CubeIDE da 0. Procederemo seguendo quest'\textbf{ultima strada}.
+Attenzione: per disinstallarlo bisogna eseguire questi comandi:
+
+\begin{verbatim}
+    Cache:
+    rm -rf ~/.stm32cubeide 
+    rm -rf ~/.eclipse 
+    rm -rf ~/.stm32cubemx 
+    rm -rf ~/STM32Cube/Repository
+    Workspace:
+     rm -rf ~/STM32CubeIDE/workspace_*
+    Tuttavia, quando si reinstalla e si accetta la licenza, viene detto: 
+    Nothing to install.
+\end{verbatim}
+Cercando quindi di rintracciare l'errore in tutti i modi, anche cercando di far partire l'installer .sh in una cartella pulita senza spazi nel nome. Alla fine, il vero problema è la \textit{traccia rimasta in dpkg}: 
+\begin{verbatim}
+    dpkg -l 'stm32cubeide' 
+\end{verbatim}
+mostra output. Allora procedere con remove: 
+\begin{verbatim}
+    sudo dpkg -r st-stm32cubeide-1.19.0
+\end{verbatim}
+Ora possiamo procedere a reinstallare cubeIDE. Rircordarsi assolutamente di reinstallare i \textit{conf tools} per la board, come fatto per 411RE.
+Ultimo ma non meno importante errore è che ora CubeIDE non trova l'elenco totale delle board: rischiamo che alcuni file importanti non vengano installati.
+
+Seguendo il supporto ufficiale, pare che questa situazione capiti soprattutto in presenza di \textit{firewall}. In ogni caso, connettersi con hotspot la prima volta e d'ora in poi ad ogni nuovo progetto la lista sarà gia \textbf{precaricata}.
+
+\subsection{Nuova strada: Plugin X-CUBE-AI}
+\subsubsection{Introduzione}
+Per seguire meglio, riprendere il discorso di conversione e quantizzazione 8 bit prima di continuare a leggere. Si converte quindi in \textbf{tflite} (in realtà non necessario qui) e si utilizza \textit{xxd} per convertire in CC (qui invece verrà fatto in automatico dal plugin a tempo di esecuzione).
+
+Il plugin in oggetto è stato sviluppato apposta per semplificare l'utilizzo di piattaforme come TFlite/Keras su MCU stm32. La prima operazione da fare quindi sarà procedere con l'installazione e, successivamente, procedere con la \textit{build} del modello sopra al microcontrollore.
+
+\subsubsection{Import del plugin e del modello}
+Navigare nel file .ioc e, sotto a Middleware e Sfotware Packs, trovare xcubeAI e installare l'ultima versione. A questo punto comparirà il plugin \textit{attivo} e si potrà cliccare per navigare nel suo menu. Attenzione: Cliccare sul plugin, spuntare Core e selezionare Application Template. \textit{Salvare}.
+
+A questo punto, riaprire cubeAI, cliccare Add Network --> tflite --> browse --> selezionare il modello e confermare. Per poter generare il codice con la logica AI, è necessario \textbf{analizzare} preventivamente il modello.
+
+\subsubsection{Note importanti}
+\begin{itemize}
+    \item Clear Pinouts: Pulire tutti i pinout nel caso vengano preventivamente popolati da funzioni standard di CubeIDE: Pinout config $\rightarrow$ Pinout $\rightarrow$ Clear Pinouts
+    \item Enable Float: Il progetto ragionerà con input/output float, nonostante il microcontrollore ragioni in int8. Per debug, per ora attivare i float in printf/scanf : Project $\rightarrow$ Properties $\rightarrow$ C/C++ Build $\rightarrow$ Settings $\rightarrow$ MCU Settings $\rightarrow$ spunta “Use float with printf”
+    \item Clock A 160MHz: Per evitare problemi durante la trasmissione dei dati da e verso l’esterno (rispetto al modello) configurare il clock massimo per essere sicuri di aver abbastanza velocità di ragionamento.
+\end{itemize}
+
+\subsubsection{Analisi del modello}
+A questo punto possiamo procedere con l'analisi del modello, prima di importarlo. Selezionare Analyze $\rightarrow$ verrà mostrato un errore classico: non si può aprire la shell qui (serve WISH window shell):
+
+\begin{verbatim}
+sudo apt install tcl tk
+\end{verbatim}
+
+Tool Command Language serve per lo \textit{scripting} mentre Tk (Toolkit) serve per le \textit{interfacce grafiche} (GUI), tra cui Window Shell). Ora analizza correttamente con output su shell IDE.
+
+\subsubsection{Compilazione e risoluzione dei warning.}
+Procediamo quindi con la compilazione e risoluzione dei warning. Build $\rightarrow$ Build Project. 
+
+% Estratto dei warning del linker in STM32CubeIDE
+\begin{lstlisting}[language=bash]
+.text._close_r+0x0c): warning: _close is not implemented and will always fail
+.text._fstat_r+0x0e): warning: _fstat is not implemented and will always fail
+.text._getpid_r+0x09): warning: _getpid is not implemented and will always fail
+.text._isatty_r+0x0c): warning: _isatty is not implemented and will always fail
+.text._kill_r+0x0e): warning: _kill is not implemented and will always fail
+.text._lseek_r+0x10): warning: _lseek is not implemented and will always fail
+.text._read_r+0x10): warning: _read is not implemented and will always fail
+.text._write_r+0x10): warning: _write is not implemented and will always fail
+\end{lstlisting}
+
+Il file .elf sarà correttamente generato, ma verranno esposti dei \textit{warning} (che la board traduce come Error a tempo di compilazione) riguardanti libreria standard (newlib-nano), tipici quando si hanno a disposizione printf() o funzioni C generate in automatico e chiamanti system call POSIX (_close, _kill, _lseek, _read, ...).
+
+Esse non esistono sul microcontrollore, e come abbiamo già detto andranno reindirizzate. Per una soluzione più \textit{pulita}, stavolta implementeremo un file che a tempo di compilazione risolverà tutti questi problemi. Posizionarlo in Src e al resto penserà il compilatore. 
+
+\textbf{Nota}: Attivare ora UART1, altrimenti la modifica sull'header di print/scan non potrà essere applicata. Con NVIC Interrupt.
+
+% syscalls_min.c minimale con reindirizzamento stdout/stderr -> UART1
+\begin{lstlisting}[language=C]
+// Core/Src/syscalls_min.c
+#include <sys/stat.h>
+#include <sys/unistd.h>
+#include <errno.h>
+#include "stm32u5xx_hal.h"
+#include "stm32u5xx_hal_uart.h"
+
+extern UART_HandleTypeDef huart1;
+
+// stdout/stderr -> UART1
+int _write(int file, char *ptr, int len) {
+    if (file == STDOUT_FILENO || file == STDERR_FILENO) {
+        HAL_UART_Transmit(&huart1, (uint8_t *)ptr, len, HAL_MAX_DELAY);
+        return len;
+    }
+    errno = EBADF;
+    return -1;
+}
+
+int _read(int file, char *ptr, int len) {
+    if (file == STDIN_FILENO) {
+        errno = EAGAIN;
+        return -1;
+    }
+    errno = EBADF;
+    return -1;
+}
+
+int _close(int file) {
+    (void)file;
+    errno = ENOSYS;
+    return -1;
+}
+
+int _fstat(int file, struct stat *st) {
+    (void)file;
+    st->st_mode = S_IFCHR;
+    return 0;
+}
+
+int _isatty(int file) {
+    return (file == STDIN_FILENO ||
+            file == STDOUT_FILENO ||
+            file == STDERR_FILENO) ? 1 : 0;
+}
+
+off_t _lseek(int file, off_t ptr, int dir) {
+    (void)file;
+    (void)ptr;
+    (void)dir;
+    errno = ENOSYS;
+    return -1;
+}
+
+int _getpid(void) {
+    return 1;
+}
+
+int _kill(int pid, int sig) {
+    (void)pid;
+    (void)sig;
+    errno = ENOSYS;
+    return -1;
+}
+\end{lstlisting}
+
+Ora ad ogni \textbf{run} (cioè deployment sulla board) il modello sarà caricato senza errori. Da notare che il run implica il caricamento in flash del modello e conseguente setup in RAM dell’arena Tensorflow. Quindi, tutto in \textit{automatico}. Vedremo poi l'infrastruttura che viene creata durante il run e come ragione, per poi riuscire a interagirci tramite \textbf{UART}.
+
+\textbf{Considerazioni finali}
+\begin{itemize}
+    \item Stm32cube ide non è in grado di convertire da solo ad hoc, ma solo specificando nella tendina il 'grado' di \textit{compressione} e su quale obiettivo (RAM o Flash). Puoi anche selezionare un modello h5 leggero nel caso tu sia riuscito a crearlo e runnarlo puro \textit{così com'è}.  
+    \item Il modello di partenza in h5, per ora, pesa solo 1Mb. Non realistico. In ogni caso, quantizzandolo con il convertitore [senza precisione, vedi punto 3] esso risulta 1/10 (~100kB) (CNN). Invece LSTM + CNN ~1200kB --> 120kB miniaturizzato. 
+    \item Quando si avrà scelto il modello, bisogna stare attenti durante la conversione: andrà scelto accuratamente (e non random, come ora) \textbf{il batch di representative dataset} su cui quantizzare: di fatti, quando il modello viene rimpicciolito, bisogna far 'notare' al modello il tipico \textbf{range} di dati di input. Così verranno 'eliminati' quegli intervalli di ingresso. Volendo fare un esempio, immaginiamo che il range della temperatura tipico sia tra i 30 e i 70 gradi. Non ha per niente senso scegliere un intervallo comprendente valori sotto zero.
+    \item Quando dico 1/10 in realtà intendo \textbf{1/3}: praticamente il modello andando su proprietà dal file system vediamo che pesa 1Mb, ma in realtà la parte irremovibile in deployment sono solo i pesi (~300kB) e le attivazioni (~10kB). Il resto dell'architettura non serve su un microcontrollore e verrebbe di per sè scartata in automatico nel caso di deployment puro. Di conseguenza, l'effettiva riduzione h5 --> tflite è di 200kB \textbf{in meno} su 300kB (1/3). 
+\end{itemize}
+
+\subsection{Prova 1: Read/Write tramite UART}
+
+\subsubsection{Considerazioni preliminari}
+
+Sappiamo che il sensore ci restituirà valori tramite seriale RS485. Questo significa che dovremo provare l'interfaccia UART poichè tramite essa il modello sarà in grado di ricevere i dati dal sensore. Innanzitutto: 
+
+\begin{itemize}
+    \item Il sensore restituisce i dati tramite RS485. Non lo abbiamo ovviamente a disposizione. Per essere in grado di simulare questi dati, è necessario un \textbf{dongle USB-RS485}. 
+    \item U545RE non ha un'interfaccia diretta, bisogna usare un \textbf{tranceiver RS485 a TTL}. Attenzione: la board è \textbf{3.3V} (Non 5, più standard nei tranceiver). Per evitare di \textit{friggere} i pin, prestare attenzione al chipset presente nel convertitore. Deve integrare MAX/SP3485 (485 3V). 
+    \item In uno scenario industriale (non con fili corti su un banco d'ufficio) sarebbero necessarie resistenze e cavi ethernet twisted, soprattutto in caso vi siano \textbf{lunghe distanze} da coprire con i cavi.
+\end{itemize}
+Saranno inoltre opportuni i cavetti di connessione per strip pin DUPONT (maschio-femmina)
+
+\subsubsection{Setup}
+Ora che il modello è correttamente caricato sulla U545RE, dobbiamo cercare di interagirci tramite comandi (READ della board da PC) e reinderizzare l'output in modo visualizzabile (WRITE dalla board verso PC). Proviamo un approccio rapido e semplice tramite ASCII Seriale.\textbf{Nota}: la CNN produce inferenza dopo una finestra di 30 righe di 19 valori. 
+
+Fino ad adesso abbiamo utilizzato \textit{screen}. Come suggerisce il nome, esso visualizza ma \textbf{NON} permette l'invio. Per l'invio e ricezione seriale da PC, useremo \textit{minicom}. Prima di ciò, abilitare l'interrupt da NVIC di UART1 e abilitare i float nel compilatore: 
+\begin{center}
+    Project $\rightarrow$ Properties $\rightarrow$ C/C++ Build $\rightarrow$ Settings $\rightarrow$ MCU Settings $\rightarrow$ spunta “Use float with printf” (oppure aggiungi al linker flag: -u _printf_float).
+\end{center}
+Installare quindi minicom: 
+
+\begin{verbatim}
+sudo apt install minicom
+\end{verbatim}
+Ora prima di avviarlo dobbiamo modificare le funzioni per un corretto funzionamento. Facciamo chiarezza: 
+main.c è l'orchestratore: 
+\begin{itemize}
+    \item Inizializza la board come configurato in .ioc
+    \item Nel while true chiama la funzione AI_Process (il main della AI implementation) con la logica che si vuole.
+\end{itemize}
+
+% MX_X_CUBE_AI_Process
+\begin{lstlisting}[language=C]
+void MX_X_CUBE_AI_Process(void)
+{
+    int res = -1;
+
+    if (network) {
+        /* tenta inferenza SOLO quando la finestra è pronta */
+        res = acquire_and_process_data(data_ins);
+        if (res == 0) {
+            res = ai_run();
+            if (res == 0) res = post_process(data_outs);
+        }
+    }
+
+    if (res && res != -1) {
+        ai_error err = {AI_ERROR_INVALID_STATE, AI_ERROR_CODE_NETWORK};
+        ai_log_err(err, "Process has FAILED");
+    }
+}
+\end{lstlisting}
+
+\begin{itemize}
+    \item Se la network è attiva, chiama la funzione acquire_process (funzione da estendere per la read dei parametri esterni ad es. per quantizzarli) che se la window è pronta, esegue (e quindi può preparare i dati) 
+    \item Chiama ai_run che inserisce i parametri acquisiti e processati DENTRO al modello (parte di inference vera e propria) 
+    \item Chiama il post_process su di esso (anche questa funzione da estendere, ad esempio per dequantizzare i valori in uscita dalla rete). 
+\end{itemize}
+
+\begin{center}
+    \textbf{Ricordarsi di rimanere nello user space code. Se si esce o si rimuove il tag precaricato, si rischia di perdere tutto.}
+\end{center}
+
+
+
+
+\subsubsection{Implementazione}
+
+Quando arrivano i dati sulla \textbf{porta seriale}, viene eseguito un interrupt e l'handling viene eseguito da HAL_UART_RxCpltCallback. Dovrà essere impostata in modo da \textit{pushare i caratteri dentro a un buffer} che, se arriva a 30 righe, setta la finestra a \textit{window_ready=1}. Nota: il buffer è globale in RAM e leggibile da AI branch. 
+
+% Callback UART RX: costruzione riga e push allo stack AI
+\begin{lstlisting}[language=C]
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart == &huart1) {
+        uint8_t c = rx_byte;
+
+        if (c == '\n' || c == '\r' || rx_idx >= (RX_LINE_MAX - 1)) {
+            rx_line[rx_idx] = 0;
+            if (rx_idx > 0) {
+                /* passa la riga (19 valori attesi) allo stack AI */
+                ai_push_line_of_19((char *)rx_line);
+            }
+            rx_idx = 0;
+        }
+        else {
+            rx_line[rx_idx++] = c;
+        }
+
+        /* riabilita ricezione 1 byte */
+        HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
+    }
+}
+\end{lstlisting}
+
+Utilizzeremo dentro questa funzione dichiarata in app_cube_AI(): 
+
+% Push di una riga di 19 valori float nel ring buffer
+\begin{lstlisting}[language=C]
+int ai_push_line_of_19(const char *line)
+{
+    float vals[N_CH];
+
+    if (parse_19_values(line, vals) != 0) {
+        printf("ERR parse: attesi %d valori, ricevuto \"%s\"\r\n", N_CH, line);
+        return -1;
+    }
+
+    /* Copia nel ring */
+    if (ring_count < N_STEPS) {
+        for (int i = 0; i < N_CH; i++)
+            ring[ring_count][i] = vals[i];
+        ring_count++;
+    } else {
+        /* shift (semplice): scarta la piu vecchia e aggiungi la nuova */
+        for (int t = 1; t < N_STEPS; t++)
+            for (int c = 0; c < N_CH; c++)
+                ring[t-1][c] = ring[t][c];
+
+        for (int i = 0; i < N_CH; i++)
+            ring[N_STEPS-1][i] = vals[i];
+    }
+
+    if (ring_count >= N_STEPS) {
+        window_ready = 1;
+    }
+    return 0;
+}
+\end{lstlisting}
+
+A questo punto, acquire_process può \textit{decapsulare} il buffer globale e quantizzarlo. Poi, nel main dell'AI, il risultato dell'acquire viene dato in pasto al layer di \textbf{inferenza} ai_run (non mostrata perchè costante) e questo risultato, salvato in un altro buffer globale, verrà dato in ingresso al \textit{post_process} finale. Questo post processing si preoccuperà di de-quantizzare l'output: 
+
+% post_process: dequantizzazione, stampa output, top-3, consumo finestra
+\begin{lstlisting}[language=C]
+int post_process(ai_i8 *data[])
+{
+    ai_i8 *src = data[0];   // 19 byte
+    float f[N_CH];
+    int   argmax = 0;
+    float vmax   = -1e30f;
+
+    printf("OUTPUT int8: ");
+    for (int i = 0; i < N_CH; i++) {
+        printf("%d%s",
+               (int)((int8_t)src[i]),
+               (i == N_CH-1 ? "\r\n" : ","));
+    }
+
+    printf("OUTPUT float: ");
+    for (int i = 0; i < N_CH; i++) {
+        f[i] = dequant_out((int8_t)src[i]);
+        if (f[i] > vmax) { vmax = f[i]; argmax = i; }
+        printf("%.5f%s",
+               f[i],
+               (i == N_CH-1 ? "\r\n" : ","));
+    }
+
+    /* top-3 */
+    int   idx[3] = { -1, -1, -1 };
+    float val[3] = { -1e30f, -1e30f, -1e30f };
+
+    for (int i = 0; i < N_CH; i++) {
+        float v = f[i];
+        if (v > val[0]) {
+            val[2] = val[1]; idx[2] = idx[1];
+            val[1] = val[0]; idx[1] = idx[0];
+            val[0] = v;      idx[0] = i;
+        } else if (v > val[1]) {
+            val[2] = val[1]; idx[2] = idx[1];
+            val[1] = v;      idx[1] = i;
+        } else if (v > val[2]) {
+            val[2] = v;      idx[2] = i;
+        }
+    }
+
+    printf("ARGMAX: %d (%.5f) | TOP3: %d:%.5f, %d:%.5f, %d:%.5f\r\n",
+           argmax, f[argmax],
+           idx[0], val[0],
+           idx[1], val[1],
+           idx[2], val[2]);
+
+    /* Consuma la finestra: richiedi nuove 30 righe */
+    window_ready = 0;
+    ring_count   = 0;
+    return 0;
+}
+\end{lstlisting}
+
+\subsubsection{Esecuzione}
+
+Ora siamo pronti: Ricordando che la comunicazione seriale è \textbf{UNICO} e quindi se ci sono due terminali in ascolto che devono mostrare output, arriverà solo ad uno (o ad entrambi sparsi se siamo sfortunati). Eseguiamo minicom: 
+
+\begin{verbatim}
+    minicom -D /dev/ttyACM0 -b 115200 
+\end{verbatim}
+Runniamo la board per vedere stampato correttamente l'inizializzazione:
+
+ % Banner di minicom
+\begin{lstlisting}[language=bash]
+Welcome to minicom 2.9
+
+OPTIONS: I18n
+Port /dev/ttyACM0, 15:58:58
+
+Press CTRL-A Z for help on special keys
+
+TEMPLATE - initialization
+
+Board pronta. Invia 19 valori separati da virgola, termina con \\n\\r\\n
+\end{lstlisting}
+L'output purtroppo sarà:
+
+% Messaggi di errore parse
+\begin{lstlisting}[language=bash]
+ERR parse: attesi 19 valori, ricevuto "0.31,0.44,0.50,0.66,0.70,0.01,0.11,0.22,0.33"
+ERR parse: attesi 19 valori, ricevuto "05,0.12,0.56,0.77,0.02,0.31,0.44,0.50,0.66,0.70,0.01,0.11,0.22,0.33"
+ERR parse: attesi 19 valori, ricevuto "0.66,0.70,0.01,0.11,0.22,0.33"
+ERR parse: attesi 19 valori, ricevuto "0.22,0.33"
+ERR parse: attesi 19 valori, ricevuto "50,0.66,0.70,0.01,0.11,0.22,0.33"
+ERR parse: attesi 19 valori, ricevuto "34,0.00,0.98,0.10,0.05,0.12,0.56,0.77,0.02,0.31,0.44,0.50,0.66,0.70,0.01,0.11,0.22,0.33"
+\end{lstlisting}
+
+Risparmiando le immagini che mostrano esattamente la ricerca dell’errore, semplicemente bisogna \textit{rimuovere le print di debug da dentro il looper} che desincronizza la ricezione lato board. Questo problema era già stato reso noto all'inizio. In questo modo, organizzando il codice ad hoc per TX e RX, si può rendere chiara l'esecuzione:
+
+% Main loop con copia protetta della riga e ACK
+\begin{lstlisting}[language=C]
+log_uart("[RX] Board pronta. Invia 19 valori separati da virgola, termina con \\n\\r\\n");
+HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
+static uint32_t ok_count = 0;
+
+while (1)
+{
+    if (line_ready) {
+        __disable_irq();
+        strncpy(line_copy, rx_line, sizeof(line_copy));
+        line_copy[sizeof(line_copy) - 1] = '\0';
+        line_ready = 0;
+        __enable_irq();
+
+        int r = parse_and_push_line(line_copy);
+        log_uart("[RX] OK: riga accettata\r\n");   // <-- ACK per ogni riga
+        // se vuoi tenere anche il contatore x5, lascialo sotto
+        if ((++ok_count % 5U) == 0U)
+            log_uart("[RX] OK: riga accettata (x5)\r\n");
+    }
+
+    MX_X_CUBE_AI_Process();
+    HAL_Delay(1);
+}
+\end{lstlisting}
+
+A questo punto, per evitare errori, inviamo accuratamente la finestra in seriale utilizzando un semplice script in Python:
+
+% Script Python di invio righe via seriale con ACK
+\begin{lstlisting}[language=Python]
+def wait_for_ack(ser, timeout=2.0):
+    """Legge dalla seriale fino a quando trova l'ACK o scade il timeout"""
+    t0 = time.time()
+    buf = ""
+    while time.time() - t0 < timeout:
+        chunk = ser.read(1024).decode(errors="ignore")
+        if chunk:
+            sys.stdout.write(chunk)
+            sys.stdout.flush()
+            buf += chunk
+            if ACK_TOKEN in buf:
+                return True
+        else:
+            time.sleep(0.01)
+    return False
+
+
+def main():
+    try:
+        ser = serial.Serial(PORT, BAUD, timeout=0.1, write_timeout=1)
+    except Exception as e:
+        print(f"[ERR] Open serial: {e}")
+        sys.exit(1)
+
+    time.sleep(0.5)
+    print(f"[OK] Porta aperta: {PORT} @ {BAUD}")
+
+    # banner iniziale
+    wait_for_ack(ser, timeout=1.0)
+
+    # carica righe
+    try:
+        lines = [
+            ln.strip()
+            for ln in pathlib.Path(CSV).read_text().splitlines()
+            if ln.strip()
+        ]
+    except Exception as e:
+        print(f"[ERR] Lettura CSV: {e}")
+        ser.close()
+        sys.exit(1)
+
+    print(f"[*] Invierò {len(lines)} righe dal file {CSV}")
+
+    for i, ln in enumerate(lines, 1):
+        data = (ln + "\r\n").encode("ascii")
+        ser.write(data)
+        ser.flush()
+        print(f"[TX] riga {i} ({len(data)} byte)")
+
+        if not wait_for_ack(ser, timeout=2.0):
+            print(f"[WARN] Nessun ACK per la riga {i}")
+            break
+
+    print("[*] Attendo output finale...")
+    wait_for_ack(ser, timeout=5.0)
+
+    ser.close()
+    print("[OK] Done.")
+
+
+if __name__ == "__main__":
+    main()
+\end{lstlisting}
+
+
+A questo punto, senza bisogno di minicom, abbiamo la conferma che i dati in seriale arrivano e che il modello produce un inferenza:
+
+% Output di debug completo con finestra pronta e inferenza
+\begin{lstlisting}[language=bash]
+[RX] DBG: w_count=25/30
+[RX] OK: riga accettata
+[RX] DBG: w_count=26/30
+[RX] OK: riga accettata
+[RX] DBG: w_count=27/30
+[RX] OK: riga accettata
+[RX] DBG: w_count=28/30
+[RX] OK: riga accettata
+[RX] DBG: w_count=29/30
+[RX] OK: riga accettata
+[RX] DBG: w_count=30/30
+[RX] Finestra pronta: eseguo inferenza
+[RX] OK: riga accettata (x5)
+[RX] Inferenza OK (Q): 246 203 26 6 22 95 21 25
+\end{lstlisting}
+
+
+Si procede dunque a provare con un modello attuale CNN +LSTM, si proverà a ridurlo \textbf{ad hoc} e importarlo su \textbf{u545re}.
+
+\subsubsection{Carrello}
+
+\begin{itemize}
+    \item Tranceiver max485 rischia di danneggiare STM32 (usa 5V ma noi abbiamo 3V. Meglio max3485 per interfacciamento.
+    \item Waveshare Industrial USB to RS485 Converter with Original CH343G And SP485EEN 300bps per simulare un sensore Bonfiglioli
+    \item Dongle : WaveShare Industrial USB to RS485 equipaggiato con ftdi (FT232RNL \& SP485EEN) oppure anche con l'equivalente CH343G, costa la metà ma meno robusto e meno supportato nativamente (non è detto che unix si veda subito ttyUSBx).
+    \item Cavetti Dupont
+    \item Resistenze opz, ethernet cable twisted opz (Per coprire lunghe distanze
+\end{itemize}
+
+
+\section{Sezione 5 -- Quantizzazione}
+
+Per portare un modello da float32 a \textbf{int8} le sfide sono molteplici. Per fissare chiaramente le operazioni da eseguire, si segue una certa pipeline operativa:
+
+\begin{itemize}
+    \item Training del modello realistico
+    \item Analisi dei dati a disposizione e opportune considerazioni
+    \item Creazione del representative dataset
+    \item Conversione del modello a int8 .tflite
+    \item Benchmarking delle prestazioni e confronti vari
+\end{itemize}
+
+\subsection{Step 1 - Training modello realistico}
+
+\subsubsection{Introduzione}
+Allenare il modello di riferimento scelto. Per questioni di compatibilità, leggerezza e facilità di training, partiremo da un modello LSTM+CNN1d che, come mostrato dai risultati di Lucia, si comporta molto bene. Per utilizzare un modello di deployment, tuttavia, bisogna riallenarlo su più epoche (prima solo 5) e fermarsi tramite il paradigma \textbf{EarlyStopping}. Da notare infine che si predilige l'utilizzo del formato ``SavedModel``, ovvero una cartella con più facile accesso al modello stesso (e quindi maggior controllo per quantizzazione).
+
+\begin{center}
+    Nota: Togliere l'esecuzione di grafici sulla gui, bloccano lo script su slurm. 
+\end{center}
+
+\begin{verbatim}
+import matplotlib
+matplotlib.use("Agg") # headless
+import matplotlib.pyplot as plt
+\end{verbatim}
+e sostituire \texttt{plt.show()} con:
+
+\begin{lstlisting}[language=Python]
+import os
+os.makedirs("logs", exist_ok=True)
+plt.savefig("logs/cnn_lstm_training.png",
+            dpi=150, bbox_inches="tight")
+\end{lstlisting}
+Per controllare a che epoca siamo attualmente: 
+\begin{verbatim}
+tail -f logs/cnn_lstm_*out | grep -E 'Epoch'
+\end{verbatim}
+
+\subsubsection{Export sul pre-trained}
+Dal momento che il codice andrebbe modificato e analizzato approfonditamente per utilizzare le GPU (per via di LSTM), per ora alleneremo con CPU. Dopo 2 ore e circa 30 epoche, il modello converge.
+Facendo un salto in avanti, si avranno problemi durante l'export in tflite per via di operazioni CudnnRNNV3 incluse presenti. Basterebbe rimuoverle prima dell'allenamento se tanto si usa CPU, ma... procederemo dunque a danno fatto (purtroppo \textbf{abbiamo già allenato}. Avendo quindi h5, si utilizza una funzione post-training che creerà il modello ``unrolled''. [Unrolled=true]
+
+\texttt{export\_utils\_withoutOPS.py}:
+
+\begin{lstlisting}[language=Python]
+def create_cnn_lstm_model(window_size, n_feat, forecast_len, n_hidden=64):
+    optimizer = Adam(learning_rate=0.001)
+    inputs = Input(shape=(window_size, n_feat))
+
+    x = Conv1D(64, 3, activation='relu', padding='same')(inputs)
+    x = MaxPooling1D(2)(x)
+    x = Dropout(0.3)(x)
+
+    x = Conv1D(128, 3, activation='relu', padding='same')(x)
+    x = MaxPooling1D(2)(x)
+    x = Dropout(0.3)(x)
+
+    # DIFFERENZA UNICA: unroll=True per eliminare TensorArray/TensorList
+    x = LSTM(n_hidden, return_sequences=False, unroll=True)(x)
+
+    x = Dense(64, activation='relu')(x)
+    outputs = Dense(forecast_len * n_feat)(x)
+    outputs = Reshape((forecast_len, n_feat))(outputs)
+
+    model = Model(inputs, outputs)
+    model.compile(optimizer=optimizer, loss='mse')
+    return model
+\end{lstlisting}
+
+\subsection{Step 2 - Analisi dei dati a disposizione e opportune considerazioni}
+
+Prima di procedere è necessario considerare il dataset di partenza. Questo passaggio è doveroso poichè si avrà, per ovvi motivi, un calo di prestazioni; se gestito nel modo corretto, l'errore può essere ridotto in un range prossimo allo 0.
+Per cominciare, una buona prassi è analizzare il set di dati con cui il modello è stato allenato utilizzando dei diagrammi comuni nel mondo AI. Da notare come questa analisi è abbastanza limitata: ci servirà solo ai fini della quantizzazione. Per l'analisi approfondita, consultare il lavoro di Giacomo.
+Stampiamo dunque gli istogrammi di ogni variabile, la matrice di correlazione e le loro versioni 'csv' (la vera risposta, non solo visiva).
+
+\subsubsection{Fattori da considerare}
+
+\begin{itemize}
+    \item Campane: istogrammi a campana sono di \textit{facile gestione} (i valori stanno in un certo intorno senza scostarsi troppo dal valore medio) poichè si riescono a tagliare i valori che non si presenteranno mai. Così facendo, inserire i relativi tensori in uno spazio di indirizzamento 2$^8$ è più efficace. 
+    \item Zero point: se gli istogrammi a campana non sono centrati, lo 'zero' andrà spostato \textit{verso il cuore della campana} stessa durante il processo di quantizzazione, per ovvi motivi
+    \item Campane doppie: allargano i casi che si possono presentare, ma non determinano (in prima battuta) un grave problema: \textit{allargano la memoria} necessaria.
+    \item Code: se, per via di glitch/guasti sono presenti anomalie nel dataset, allora sicuramente compariranno \textit{molto distanti} dalla campana dei valori normali. Queste sono le code. In quantizzazione bisogna includerle, e se questo non viene fatto, seppur in piccole quantità, si rischia il \textbf{clipping}.
+    \item Clipping: 
+    \begin{itemize}
+        \item Il modello iniziale è allenato a vedere temperature normali tra 20° e 40°. Se arriva 60°, viene segnalato anomalo. avendo abbastanza spazio di valori potenzialmente infinito (32 o 64) è in grado di riconoscere qualsiasi valore anomalo
+        \item Il modello quantizzato purtroppo non ha questo vantaggio: quando miniaturizzo devo dare un \textbf{range}, una 'vista', ovvero tutto il range di valori che potenzialmente può vedere. ANOMALIE INCLUSE, SE CI SONO STATE. Questo poichè se la 'vista' del modello quantizzato è 20°- 40°, per motivi DIGITALI i valori fuori range vengono \textbf{schiacciati} (CLIPPATI) agli estremi. 60° viene considerato esattamente come 40°. Di conseguenza, bisogna sempre includere le code nei modelli quantizzati per 'preparare' il modello a vedere eventuali anomalie, se ci sono state. In questo modo 60° sarà circa considerato un 43° (più di un regolare 40°!) In allenamento, invece, vanno escluse per \textit{ovvi motivi}.
+        \item Ovviamente vanno incluse senza esagerare: questo poichè la quantizzazione funziona con l'arrotondamento al numero piu vicino. Più si allarga lo spazio, e più si perde di precisione. Ad esempio se devo rappresentare un range 0 10 in un quantizzato 0 5, e normalmente i valori oscillano tra 2 3 e 4, qualche volta 9 (anomalia), devo stare attento a non allargare. Se 2 droppa a 0q, 3 droppa a 1q, e 4 droppa a 2q $\rightarrow$ 9 è messo a 4q $\rightarrow$ OK perfetto. Se allargo troppo perchè voglio sottolineare quanto il 7 sia distante dal 4, allora si rischia: 2 droppo a 0q, 3 droppo a 0q \textbf{DI NUOVO}, ... con un bit rappresento due valori diversi. Perdo precisione laddove la campana è \textit{normale}.
+    \end{itemize}
+    \item Correlazione: per ovvi motivi, variabili simili ad altre per valori possono essere 'unite'.
+\end{itemize}
+Bisogna trovare quindi un giusto equilibrio. Dai dati, questo è possibile: abbiamo molte campane regolari, e le code sono poche e isolate. Useremo uno script per stampare i resoconti sopracitati, assieme ai csv per avere un riscontro diretto basato sui dati e non solo visivo (anche perchè individuare code in grafici non sufficientemente adattati è impossibile).
+\textbf{analisi.py:}
+
+\begin{lstlisting}[language=Python]
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+
+# === PARAMETRI ===
+file_csv = "/home/projects/safe/data/processed-datasets/processed_streaming_row_continuous.csv"
+
+print(f"Carico intero dataset da {file_csv} ...")
+df = pd.read_csv(file_csv)
+
+# === PULIZIA BASE ===
+df_num = df.select_dtypes(include=['number'])
+print(f"Colonne numeriche: {len(df_num.columns)}")
+
+# === STATISTICHE COMPLETE ===
+stats = df_num.describe(percentiles=[0.01, 0.05, 0.5, 0.95, 0.99]).T
+stats = stats[['mean', 'std', 'min', '1%', '5%', '50%', '95%', '99%', 'max']]
+stats.to_csv("stats_completo.csv")
+print("Salvato: stats_completo.csv (media, std, min/max, percentili)")
+
+# === VARIABILITÀ RELATIVA ===
+stats["range"] = stats["max"] - stats["min"]
+stats["coeff_var"] = stats["std"] / (np.abs(stats["mean"]) + 1e-9)
+top_var = stats.sort_values("coeff_var", ascending=False).head(10)
+print("\n⚙️ Variabili più instabili (coefficiente di variazione):")
+print(top_var[["mean", "std", "coeff_var"]])
+
+# === CORRELAZIONI ===
+corr = df_num.corr()
+plt.figure(figsize=(14, 12))
+sns.heatmap(corr, cmap="coolwarm", center=0, square=True, cbar_kws={'shrink':0.6})
+plt.title("Matrice di correlazione (tutte le variabili)")
+plt.tight_layout()
+plt.savefig("correlazioni_full.png", dpi=300)
+plt.close()
+print("Salvato: correlazioni_full.png")
+
+# === ISTOGRAMMI ===
+cols = df_num.columns
+n = len(cols)
+ncols = 4
+nrows = (n + ncols - 1) // ncols
+
+plt.figure(figsize=(ncols * 4, nrows * 3))
+df_num.hist(bins=50, figsize=(ncols * 4, nrows * 3), layout=(nrows, ncols))
+plt.suptitle("Distribuzione dei valori (tutte le variabili)")
+plt.tight_layout(rect=[0, 0, 1, 0.97])
+plt.savefig("istogrammi_full.png", dpi=300)
+plt.close()
+print("Saved: istogrammi_full.png")
+
+# === CORRELAZIONI PRINCIPALI (heatmap ridotta)
+abs_corr = corr.abs()
+corr_pairs = abs_corr.unstack().sort_values(ascending=False)
+corr_pairs = corr_pairs[corr_pairs < 1]  # esclude diagonale
+top_corr = corr_pairs.head(20)
+top_corr.to_csv("top_corr_pairs.csv")
+print("Salvato: top_corr_pairs.csv (20 coppie più correlate)")
+
+print("\n OK.")
+    
+\end{lstlisting}
+
+\subsection{Step 3 - Creazione del representative dataset}
+
+\subsubsection{Introduzione}
+Sulla base delle precedenti affermazioni, siamo quindi pronti a creare il \textbf{representative dataset}, colui che ``preparerà'' il modello per riuscire a \textbf{vedere} i range correttamente. Sarà quindi come un piccolo `allenamento` che imposterà i range \textbf{visibili}, anomalie comprese. Per il momento, ci limiteremo a creare questo dataset partendo da un'impostazione classica per anomaly detection. Si procederà poi in fase di benchmarking ad eseguire il tuning necessario (es. aumento numero di finestre anomale --> evito clipping ma diminuisco precisione).
+Un'impostazione iniziale di creazione dell'\textbf{npz} prevedere l'utilizzo di un estrattore che, sulla base del dataset, estrae le feature più interessanti. Le mantiene in float ``continuo`` (visto da int8) e potrà dunque suggerire al convertitore tflite la quantizzazione negli intervalli cercati.
+Per comodità si crea uno script che permette il passaggio da terminale dei parametri, tra cui quelli \textbf{fissi} del modello (feature, forecast, ...) e poi quelli di \textbf{tuning} che verranno provati con diverse combinazioni.
+
+\subsubsection{Parsing}
+
+\begin{lstlisting}[language=Python]
+ap = argparse.ArgumentParser(
+    description="Crea rep_windows_balanced.npz (robusto a timestamp/object)"
+)
+ap.add_argument("--csv", required=True)
+ap.add_argument("--savedmodel", required=False, default=None)
+ap.add_argument("--outdir", default=None)
+ap.add_argument("--window", type=int, default=30)
+ap.add_argument("--forecast", type=int, default=10)
+ap.add_argument("--nfeat", type=int, default=16)
+ap.add_argument("--stride", type=int, default=1)
+ap.add_argument("--batch_size", type=int, default=2048)
+ap.add_argument("--max_total", type=int, default=2000)
+ap.add_argument("--balance", type=float, default=0.5)
+ap.add_argument("--seed", type=int, default=42)
+ap.add_argument(
+    "--min_numeric_frac",
+    type=float,
+    default=0.9,
+    help="Quota minima per trattare una colonna object come numerica",
+)
+args = ap.parse_args()
+\end{lstlisting}
+
+\subsubsection{Pulizia e standardizzazione}
+
+Si \textit{legge} il CSV, si \textit{puliscono} (magari colonna lasciata testo) e \textit{convertono} (o eliminano, esempio timestamp) opportunamente tutte le colonne. Poi, vanno \textit{standardizzate} (media 0, deviazione 1) così nel caso vi sia ad esempio un valore di temperatura tra 0 e 50° e un altra feature con valori ben piu alti (es. 1000) non si rischia di avere \textit{sbilanciamenti} durante somme/differenze in algoritmi:
+
+\begin{equation}
+x' = \frac{x - \mu}{\sigma}
+\end{equation}
+
+\begin{lstlisting}[language=Python]
+# Standardizzazione...
+print("[4/6] Standardizzazione...")
+if HAVE_SKLEARN:
+    scaler = StandardScaler()
+    data_std = scaler.fit_transform(data).astype(np.float32, copy=False)
+    scaler_dict = {
+        "mean": scaler.mean_.tolist(),
+        "scale": scaler.scale_.tolist(),
+        "use_cols": use_cols,
+    }
+else:
+    mean = np.nanmean(data, axis=0)
+    std = np.nanstd(data, axis=0)
+    std[std == 0] = 1.0
+    data_std = (data - mean) / std
+    scaler_dict = {
+        "mean": mean.tolist(),
+        "scale": std.tolist(),
+        "use_cols": use_cols,
+    }
+
+n_rows, nfeat = data_std.shape
+print(f"[✓] Dati standardizzati: shape={data_std.shape}")
+\end{lstlisting}
+
+\subsubsection{Scoring}
+Passaggio \textbf{fondamentale}. Si creano finestre come da modello (16 feature, 30 righe) e gliele si danno in pasto (se presente, come nel nostro caso, così è più accurato). Si vede come esso ``reagisce''. Il modello infatti ad ogni step produce normalmente una \textit{predizione} dei 10 step successivi: se questa predizione ha (tra tutti quelli di output) un valore molto alto (0 nella media, +/- 1 variazione normale, +/- 2 evento forte/raro per definizione di standardizzazione) allora significa che quella finestra è \textbf{interessante} per il modello. È successo qualcosa di fuori dalla media. Assegno come score (della finestra) il valore assoluto più alto tra tutti i valori di output (della finestra). 
+Si otterrà un'insieme di finestre con diversi score. Il codice è il seguente:
+
+\begin{lstlisting}[language=Python]
+# Scoring finestre...
+print("[5/6] Scoring finestre...")
+
+predict_fn = load_savedmodel(args.savedmodel)
+scores = []
+n_windows_total = 0
+
+for Xb, _ in iter_windows(
+    data_std, args.window, args.forecast, args.stride, args.batch_size
+):
+    if predict_fn is not None:
+        try:
+            yb = predict_fn(Xb)
+            yb = np.asarray(yb)
+            score_b = np.max(np.abs(yb), axis=tuple(range(1, yb.ndim)))
+        except Exception:
+            score_b = np.max(np.abs(Xb), axis=(1, 2))
+    else:
+        score_b = np.max(np.abs(Xb), axis=(1, 2))
+
+    scores.append(score_b)
+    n_windows_total += Xb.shape[0]
+
+if n_windows_total == 0:
+    raise RuntimeError(
+        "Nessuna finestra generabile: controlla window/forecast/righe del CSV."
+    )
+
+scores = np.concatenate(scores, 0)
+
+p95 = float(np.percentile(scores, 95.0))
+max_total = int(args.max_total)
+k_tail = int(round(max_total * args.balance))
+k_norm = max_total - k_tail
+
+tail_mask = scores >= p95
+tail_idx = np.nonzero(tail_mask)[0]
+
+if len(tail_idx) > 0:
+    tail_sorted = tail_idx[np.argsort(scores[tail_idx])[::-1]]
+    tail_pick = tail_sorted[:k_tail]
+else:
+    tail_pick = np.array([], dtype=int)
+
+normal_pool = np.nonzero(~tail_mask)[0]
+if len(normal_pool) >= k_norm:
+    rng = np.random.default_rng(args.seed)
+    norm_pick = rng.choice(normal_pool, size=k_norm, replace=False)
+else:
+    norm_pick = normal_pool
+    deficit = k_norm - len(norm_pick)
+    extra_from_tail = [
+        i for i in (tail_sorted[k_tail : k_tail + deficit] if len(tail_idx) > 0 else [])
+    ]
+    tail_pick = np.concatenate([tail_pick, np.array(extra_from_tail, dtype=int)])
+
+selected_idx = np.unique(np.concatenate([tail_pick, norm_pick]))
+if selected_idx.shape[0] > max_total:
+    selected_idx = selected_idx[:max_total]
+\end{lstlisting}
+
+\subsubsection{Pooling}
+Dopo lo scoring, in input allo script verranno scelti certi parametri: ad esempio, posso scegliere un balance 0.5 su 2000 finestre per dare in ingresso 1000 finestre normali e 1000 finestre ``anormali'' (\textbf{code}) e stimare nel modo corretto gli intervalli da quantizzare. Verranno perciò estratte \textit{dopo} lo scoring solo le finestre che sono state scelte.
+
+\begin{lstlisting}[language=Python]
+# Estrazione e salvataggi...
+print("[6/6] Estrazione finestre selezionate e salvataggi...")
+
+X_sel = np.zeros(
+    (selected_idx.shape[0], args.window, nfeat), dtype=np.float32
+)
+pos_map = {int(g): i for i, g in enumerate(selected_idx)}
+
+filled, base = 0, 0
+for Xb, _ in iter_windows(
+    data_std, args.window, args.forecast, args.stride, args.batch_size
+):
+    bsz = Xb.shape[0]
+    gidx = np.arange(base, base + bsz, dtype=int)
+    mask = np.isin(gidx, selected_idx)
+    if np.any(mask):
+        where = gidx[mask]
+        src_idx = np.nonzero(mask)[0]
+        for j, gi in enumerate(where):
+            X_sel[pos_map[int(gi)]] = Xb[src_idx[j]]
+            filled += 1
+    base += bsz
+
+assert filled == X_sel.shape[0], (
+    f"Riempiti {filled}/{X_sel.shape[0]}: discrepanza indici."
+)
+\end{lstlisting}
+
+Siamo quindi pronti a procedere alla \textbf{conversione} sulla base dell'.npz generato e al suo benchmarking. Verranno poi testate diverse combinazioni npz con numero e bilanciamenti diversi di finestre al fine di individuare quelli con prestazioni più adatte al nostro caso
+
+\subsection{Step 4 - Conversione del modello a int8 .tflite}
+
+Il converter, una volta creato l'npz ad hoc, segue lo schema classico:
+
+\begin{itemize}
+    \item Si prende il modello pulito (unrolled)
+    \item Si carica il representative dataset .npz
+    \item Si imposta la conversione full INT8 e lo si salva
+\end{itemize}
+
+\begin{lstlisting}[language=Python]
+\begin{lstlisting}[language=Python]
+os.makedirs(args.outdir, exist_ok=True)
+tfl_path = os.path.join(args.outdir, "model_int8_full.tflite")
+
+rep_gen, rep_shape = rep_gen_from_npz(args.rep)
+print("Representative shape:", rep_shape)
+
+converter = tf.lite.TFLiteConverter.from_saved_model(args.savedmodel)
+converter.optimizations = [tf.lite.Optimize.DEFAULT]
+converter.representative_dataset = rep_gen
+converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+converter.inference_input_type = tf.int8
+converter.inference_output_type = tf.int8
+try:
+    converter.experimental_enable_resource_variables = True
+except Exception:
+    pass
+
+tfl = converter.convert()
+with open(tfl_path, "wb") as f:
+    f.write(tfl)
+
+print(f" Salvato: {tfl_path} ({os.path.getsize(tfl_path)/1024.0:.1f} KB)")
+
+\end{lstlisting}
+
+\subsection{Step 5 - Benchmarking delle prestazioni}
+
+Per un opportuno benchmarking delle prestazioni è bene tenere a mente i parametri principali che in prima battuta ci interessano. Si noti che sono dei differenziali, indicano quindi lo scarto tra il modello normale e quello quantizzato.
+
+\begin{itemize}
+    \item MSE (Errore quadratico \textit{medio}): media degli errori tra normale e quantizzato, dando piu peso a quelli pi grossi (è quadrato)
+    \item MAE (Errore medio \textit{assoluto}): simile, ma non pesa di più gli errori più forti
+    \item MAX (Errore assoluto massimo): confronto tra errore massimo presente per entrambi i modelli
+\end{itemize}
+
+Un altro fattore importante è il Range dei parametri: esso indica di fatto l'intervallo di valori visibili dal modello. Se questo range nel modello INT8 è allineato con quello Keras, non si ha clipping. Viceversa, quest'ultimo sarebbe presente e alzerebbe MSE e MAX in modo non trascurabile.
+Per avere un'idea dei valori ottimi, l'euristica (\textit{tratta dai paper della community}) dice:
+
+\paragraph{Errore relativo}
+\begin{equation}
+E_{\mathrm{rel}} = \frac{\mathrm{MAE}}{y_{\max}^{(\mathrm{Keras})} - y_{\min}^{(\mathrm{Keras})}}
+\end{equation}
+
+Per MAE/MSE i valori ottimi sono sotto 3/5\%, mentre per MAX sotto il 10\% (buono se sotto il 20\% e RARO). Il range di Keras (denominatore) è pari a –9.88 - +3.38 = 13.26
+Dopo una lunga serie di prove con n-finestre e balance diversi, la migliore configurazione possibile sembra essere con:
+
+\begin{itemize}
+    \item balance = 0.5
+    \item n-finestre = 2000
+\end{itemize}
+
+Con valori di benchmarking:
+
+\begin{itemize}
+    \item MSE = 0.1399
+    \item MAE = 0.2833
+    \item MAX = 1.1709
+    \item Range = −9.786 - 3.384 = 13.170
+\end{itemize}
+
+Il range è quasi identico, il clipping \textit{non è} quindi \textit{presente}. MSE/MAE rispettano a pieno gli scarti raccomandati. MAX può sembrare alto, ma come detto precedentemente è raro, quindi accettabile. Altre configurazioni come ad esempio 6000/0.3 oppure 4000/0.3 peggiorano (e non di poco) MSE / MAE.
+Si è ora dunque pronti al deployment di questo modello.
+
+\subsubsection{Confronti vari}
+Per esigenze di pubblicazione e opportuno \textit{benchmarking}, è stato creato uno script esaustivo che riproduce la pipeline sopracitata con combinazione cartesiana tra i seguenti valori:
+
+\begin{verbatim}
+max-totals 500,1000,2000,3000,4000,5000,6000
+balances   0.25,0.3,0.35,0.4,0.45,0.5,0.55,0.6
+\end{verbatim}
+
+In questo modo è in grado di stampare una tabella riassuntiva che a colpo d'occhio ci indica il modello più affidabile, con certezza (quasi) assoluta. Ovviamente, per ogni modello crea il suo npz e il suo modello int\_8 e lo salva nelle cartelle opportune, salvando anche i log per eventuali fallimenti. Da notare infine che i file sono gli stessi (OLTRE AL PROSSIMO SCRIPT DI ORCHESTRAZIONE) ma con la gestione dei path diversa. Vengono quindi omessi per esigenza di ordine.
+
+\texttt{sweep\_bench.py} (sfrutta i file sopracitati):
+
+\paragraph{Parte 1: Ciclo su tutto il prodotto cartesiano dei 2 array:}
+
+\begin{lstlisting}[language=Python]
+# Sweep
+for mt in max_totals:
+    for bal in balances:
+        exp_name = args.exp_name or f"mt{mt}_b{str(bal).replace('.', 'p')}"
+        exp_dir = out_root / "experiments" / exp_name
+        rep_dir = exp_dir / "rep"
+        tfl_dir = exp_dir / "tflite"
+        log_dir = exp_dir / "logs"
+
+        rep_dir.mkdir(parents=True, exist_ok=True)
+        tfl_dir.mkdir(parents=True, exist_ok=True)
+        log_dir.mkdir(parents=True, exist_ok=True)
+
+        status, note = "OK", ""
+        rep_npz = None
+        tfl_path = None
+        rep_count = None
+        ms_k = ms_t = mse = mae = maxe = None
+        in_scale = in_zp = out_scale = out_zp = None
+        tfl_kb = None
+\end{lstlisting}
+
+\paragraph{Parte 2: Creazione NPZ + conversione sulla base di esso:}
+
+\begin{lstlisting}[language=Python]
+try:
+    # 1) Make representative .npz (nella subfolder dedicata)
+    cmd_rep = [
+        sys.executable,
+        str(make_rep_py),
+        "--csv",
+        str(csv_path),
+        "--savedmodel",
+        str(savedmodel),
+        "--outdir",
+        str(rep_dir),
+        "--window",
+        str(args.window),
+        "--forecast",
+        str(args.forecast),
+        "--nfeat",
+        str(args.nfeat),
+        "--max_total",
+        str(mt),
+        "--balance",
+        str(bal),
+        "--seed",
+        str(args.seed),
+    ]
+    out_rep = sh(cmd_rep, log_file=log_dir / "01_make_rep.log")
+    rep_npz = find_one_with_ext(rep_dir, ".npz")
+    if not rep_npz:
+        raise FileNotFoundError(f"Nessun .npz trovato in {rep_dir}")
+    rep_count = load_npz_count(rep_npz)
+
+    # 2) Convert SavedModel -> TFLite (salva nella subfolder)
+    cmd_conv = [
+        sys.executable,
+        str(convert_py),
+        "--savedmodel",
+        str(savedmodel),
+        "--outdir",
+        str(tfl_dir),
+        "--rep",
+        str(rep_npz),
+    ]
+    out_conv = sh(cmd_conv, log_file=log_dir / "02_convert.log")
+    tfl_path = find_one_with_ext(tfl_dir, ".tflite")
+    if not tfl_path:
+        raise FileNotFoundError(f"Nessun .tflite trovato in {tfl_dir}")
+    tfl_kb = round(tfl_path.stat().st_size / 1024.0, 2)
+\end{lstlisting}
+
+\paragraph{Parte 3: Benchmarking ed estrazione}
+
+\begin{lstlisting}[language=Python]
+# 3) Benchmark (parsing dello stdout)
+cmd_bench = [
+    sys.executable, str(bench_py),
+    "--savedmodel", str(savedmodel),
+    "--tflite", str(tfl_path),
+    "--rep", str(rep_npz),
+    "-n", str(args.n_rep),
+    "--threads", str(args.threads),
+]
+out_bench = sh(cmd_bench, log_file=log_dir / "03_bench.log")
+ms_k, ms_t, mse, mae, maxe = parse_bench_output(out_bench)
+
+# 4) Estrai quant params input/output per completezza
+in_scale, in_zp, out_scale, out_zp = tflite_quant_params(tfl_path)
+
+except Exception as e:
+    status = "FAIL"
+    note = str(e).splitlines()[0][:400]
+
+writer.writerow([
+    exp_name, mt, bal, rep_count,
+    tfl_kb, ms_k, ms_t,
+    mse, mae, maxe,
+    in_scale, in_zp, out_scale, out_zp,
+    str(rep_npz) if rep_npz else "",
+    str(tfl_path) if tfl_path else "",
+    status, note
+])
+fcsv.flush()
+print(f"[{status}] {exp_name} -> rep={rep_count} | tflite={tfl_kb} KB | "
+      f"ms(K/T)={ms_k}/{ms_t} | ΔMAE={mae} | note={note}")
+\end{lstlisting}
+
+
+Si ottiene dunque a fine esecuzione dello script la seguente tabella (SEMPLIFICATA PER SCREENSHOT AL VOLO, CONSULTARE QUELLA SU PANDORA):
+
+\begin{lstlisting}[language=bash]
+combo      delta_mse   delta_mae   delta_max
+500/0.25   0.154258    0.224595    2.535102
+500/0.3    0.149146    0.215366    2.390220
+500/0.35   0.135947    0.195890    2.756309
+500/0.4    0.116878    0.173180    2.085997
+500/0.45   0.109471    0.159527    2.588607
+500/0.5    0.089351    0.140441    2.419583
+500/0.55   0.083110    0.124801    2.413585
+500/0.6    0.071744    0.108157    2.435863
+
+1000/0.25  0.198436    0.284328    3.006280
+1000/0.3   0.193024    0.273625    3.008228
+1000/0.35  0.173607    0.247947    2.699536
+1000/0.4   0.170480    0.246322    2.557407
+1000/0.45  0.145996    0.218135    2.211803
+1000/0.5   0.122290    0.185522    2.188749
+1000/0.55  0.111425    0.168255    2.513410
+1000/0.6   0.094028    0.146815    2.354192
+
+2000/0.25  0.225709    0.315712    2.596901
+2000/0.3   0.215734    0.297179    2.540597
+2000/0.35  0.178382    0.267623    2.621407
+2000/0.4   0.173820    0.260754    2.674836
+2000/0.45  0.140164    0.227182    2.247432
+2000/0.5   0.139021    0.224782    2.340996
+2000/0.55  0.117027    0.203851    1.950887
+2000/0.6   0.171444    0.218597    2.796539
+
+3000/0.25  0.196728    0.299818    2.287558
+3000/0.3   0.214530    0.303871    2.261352
+3000/0.35  0.182859    0.266342    1.965318
+3000/0.4   0.162889    0.263542    2.004873
+3000/0.45  0.168235    0.242872    2.865910
+3000/0.5   0.160733    0.238478    2.650405
+3000/0.55  0.177923    0.270855    3.121260
+3000/0.6   0.180442    0.283268    2.777947
+
+4000/0.25  0.209352    0.308989    2.401653
+4000/0.3   0.189552    0.289816    2.495068
+4000/0.35  0.166839    0.272456    2.184982
+4000/0.4   0.173457    0.270691    2.250507
+4000/0.45  0.206323    0.308978    2.269405
+4000/0.5   0.197942    0.295829    2.759492
+4000/0.55  0.224795    0.322966    2.613381
+4000/0.6   0.209366    0.316047    2.698502
+
+5000/0.25  0.217900    0.309748    2.856062
+5000/0.3   0.210940    0.307543    2.785802
+5000/0.35  0.179693    0.277684    3.053653
+5000/0.4   0.169668    0.261939    2.753847
+5000/0.45  0.196563    0.263139    2.589409
+5000/0.5   0.166242    0.235567    2.675115
+5000/0.55  0.215418    0.335652    3.230477
+5000/0.6   0.231848    0.305624    2.434017
+
+6000/0.25  0.229620    0.308866    2.508706
+6000/0.3   0.202444    0.308826    2.650822
+6000/0.35  0.218902    0.322584    2.603176
+6000/0.4   0.239517    0.307828    2.687416
+6000/0.45  0.236471    0.327992    2.987402
+6000/0.5   0.258042    0.318072    2.623040
+6000/0.55  0.250021    0.348078    2.622340
+6000/0.6   0.226573    0.323559    2.467233
+\end{lstlisting}
+
+\subsubsection{Prevedere 16 valori}
+In questo momento, la rete caricata in stm32 prevede l'utilizzo di 19 feature. Il dataset, però, non utilizza 3 variabili indipendenti (dai cavi) ma solo quelle del sensore. Visto che comunque il buffering lato STM va \textbf{cambiato}, per correttezza verranno mostrate le semplici modifiche effettuate per prevedere l'arrivo di 16 valori in ingresso alla CNN/LSTM.  
+
+Prima di tutto, modificare l'else finale di x-cubeAI in modo da poter stampare tutti i valori e non solo i più rilevanti (a fine di poter confrontare realmente dagli stessi input tra quantizzato e non):
+
+\begin{lstlisting}[language=C]
+// versione con tutti i valori e dequantizzati secondo la formula
+// applicata float = (int8 - zero_point) * scale
+else {
+    const float out_scale = 0.052055813f;
+    const int   out_zp    = 62;
+
+    int8_t   *q8      = (int8_t *)out_buf[0].data;
+    uint32_t out_len  = out_bytes / sizeof(int8_t);
+
+    char msg[256];
+    int  o = snprintf(msg, sizeof(msg), "[RX] Inferenza OK (Q->F): ");
+    for (uint32_t i = 0; i < out_len; ++i) {
+        float deq = (q8[i] - out_zp) * out_scale;
+        o += snprintf(msg + o, sizeof(msg) - o, "%.3f ", deq);
+        if (o > sizeof(msg) - 16) {          // evita overflow buffer
+            log_uart(msg);
+            o = snprintf(msg, sizeof(msg), " ");  // nuova riga indentata
+        }
+    }
+    snprintf(msg + o, sizeof(msg) - o, "\r\n");
+    log_uart(msg);
+}
+\end{lstlisting}
+A questo punto modificare x-cubeAI per 16 valori: 
+
+\begin{lstlisting}[language=C]
+/* Verifica dimensione attesa dell'input: 1x30x16 int8 = 480 byte */
+const uint32_t want_bytes = WIN * FEAT * sizeof(int8_t);
+if (in_buf[0].size != want_bytes && in_buf[0].format != AI_BUFFER_FORMAT_FLOAT) {
+    char msg[128];
+    snprintf(msg, sizeof(msg),
+             "[ERR] Input bytes=%lu attesi=%lu (non-FLOAT)\r\n",
+             (unsigned long)in_buf[0].size,
+             (unsigned long)want_bytes);
+    log_uart(msg);
+    return -1;
+}
+\end{lstlisting}
+In main.c stare attenti a chiamare le funzioni con 16 valori anzichè 19. 
+
+\subsubsection{Dequantizzazione Output}
+
+Ricordando che 16 valori con una media (μ) deviazione standard (σ) calcolate sul dataset di training, la standardizzazione trasforma ogni valore grezzo x nel suo z-score x′ e ogni colonna diventa “\textit{centrata}” (media ≈ 0) e “\textit{scalata}” (dev.std ≈ 1). 
+
+\begin{equation}
+x' = \frac{x - \mu}{\sigma}
+\end{equation}
+
+Ogni valore quindi prima di essere dato in ingresso (al modello) e prima di essere considerato output vero (del modello) va quantizzato/dequantizzato a seconda di \texttt{scale} e \texttt{zero point} del tflite utilizzato. 
+Questo significa che nel codice dell'STM32 i dati vanno dequantizzati in output a seconda di OUT\_Scale e OUT\_ZeroPoint del TFlite convertito utilizzato (Da leggere prima e da hardcorare nel codice). (Per ora, in ingresso sono pre-quantizzati)
+Per il 2000/0.5, la coppia è la seguente: 
+
+\begin{itemize}
+    \item OUT\_Scale = 0.052055813
+    \item OUT\_ZeroPoint = 62
+\end{itemize}
+Di conseguenza applichiamo:
+
+\begin{lstlisting}[language=C]
+for (uint32_t i = 0; i < out_len; ++i) {
+    float y = ((float)q8[i] - (float)OUT_ZP) * OUT_SCALE;
+    o += snprintf(msg + o, sizeof(msg) - o, "%.3f ", (double)y);
+    if (o > (int)sizeof(msg) - 16) {
+        log_uart(msg);
+        o = snprintf(msg, sizeof(msg), " ");
+    }
+}
+\end{lstlisting}
+Ora gli output sono formattati nel modo giusto. Possiamo quindi procedere ad inviare una finestra in ingresso (STANDARDIZZATA FL32). 
+
+\subsubsection{Creazione finestra stdz}
+Per creare questa finestra standardizzata, utilizzeremo un file apposito che fa questo:
+
+\begin{lstlisting}[language=Python]
+def fit_scaler_from_csv(csv_path: str, nfeat: int) -> StandardScaler:
+    df = pd.read_csv(csv_path, header=0, sep=",", low_memory=False)
+    num_df = df.select_dtypes(include=[np.number])
+    if num_df.shape[1] < nfeat:
+        raise RuntimeError(
+            f"Calib-CSV ha solo {num_df.shape[1]} colonne numeriche, servono {nfeat}."
+        )
+    data = num_df.iloc[:, :nfeat].to_numpy(dtype=np.float32, copy=False)
+    sc = StandardScaler().fit(data)
+    return sc
+
+
+def standardize(win_raw: np.ndarray, scaler: StandardScaler) -> np.ndarray:
+    return scaler.transform(win_raw.astype(np.float32, copy=False)) \
+                .astype(np.float32, copy=False)
+\end{lstlisting}
+E che viene chiamato in questo livello:
+
+\begin{lstlisting}[language=Python]
+# 1) Costruisci finestra raw 30x16
+if args.rep:
+    npz = np.load(args.rep)
+    X = npz["X"] if "X" in npz.files else list(npz.values())[0]
+    if X.shape[1:] != (args.window, args.nfeat):
+        raise RuntimeError(
+            f"REP shape={X.shape}, atteso (*,{args.window},{args.nfeat})"
+        )
+    win_std = X[0].astype(np.float32)       # già standardizzato
+    source_desc = f"REP:{args.rep}"
+    used_scaler = "pre-standardized"
+
+elif args.csv:
+    win_raw = load_window_from_csv(args.csv, args.start, args.window, args.nfeat)
+    # Scaler stimato sull'intero CSV -> stessa scala del training (se CSV è quello usato)
+    scaler = fit_scaler_from_csv(args.csv, args.nfeat)
+    win_std = standardize(win_raw, scaler)
+    source_desc = f"CSV:{args.csv}@{args.start}"
+    used_scaler = f"fit({args.csv})"
+
+else:  # args.raw
+    win_raw = load_window_from_raw(args.raw, args.nfeat, args.window)
+    if not args.calib_csv:
+        raise RuntimeError(
+            "Con --raw devi indicare --calib-csv per stimare lo StandardScaler."
+        )
+    scaler = fit_scaler_from_csv(args.calib_csv, args.nfeat)
+    win_std = standardize(win_raw, scaler)
+    source_desc = f"RAW:{args.raw}"
+    used_scaler = f"fit({args.calib_csv})"
+\end{lstlisting}
+Facciamo partire lo script:
+
+\begin{verbatim}
+python3 golden_compare_all.py \
+  --savedmodel ../export_cnn_lstm/savedmodel_unroll \
+  --tflite ../finale/qbench_sweep_20251027_165731/experiments/mt2000_b0p5/tflite/model_int8_full.tflite \
+  --csv /home/projects/safe/data/processed-datasets/processed_streaming_row_continuous.csv \
+  --start 0
+\end{verbatim}
+Ora abbiamo la finestra salvata. Manderemo con invio.py (già visto) questa finestra allo U545RE. L'output sarà il seguente:
+
+\begin{lstlisting}[language=bash]
+[RX] Inferenza OK (Q->F): 0.104 -0.052 1.145 -0.729 1.301 1.822 1.301 0.052 0.208 ...
+0.104 0.989 -0.885 0.781 -0.052 0.781 -0.156 0.104 0.000 1.145 -0.677 1.301 1.822 1.301 0.052 0.208 ...
+0.156 0.156 0.000 1.197 -0.677 1.353 1.926 1.353 0.000 0.208 0.052 0.989 -0.833 0.781 0.052 0.781 ...
+0.781 0.052 0.781 -0.156 0.104 1.145 -0.052 0.104 0.000 1.145 -0.677 1.301 1.718 1.301 0.000 0.208 ...
+...
+\end{lstlisting}
+Come possiamo controllare che questo output sia coerente con l'errore calcolato precedentemente (scarto tra modello tflite e modello Keras) e quindi confermare che il lavoro teorico abbia risultato nel pratico? 
+
+\begin{center}
+    \textit{Utilizzando sempre il file di prima con alcune estensioni.}
+\end{center}
+
+
+\subsubsection{Confronto TFlite (U545RE, vero) con Keras}
+Prendendo l'output e salvandolo in un file \texttt{outputINT8.txt}, ora possiamo procedere:
+
+\begin{itemize}
+    \item Diamo in ingresso quella finestra anche a Keras e TFlite (Offline, nel nostro pc quindi non quello STM) 
+    \item Prendiamo gli output 
+    \item Confrontiamo outINT8 di U545RE con entrambi e vediamo gli scarti.
+\end{itemize}
+Runniamo similmente ma con anche \texttt{outputINT8}:
+
+\begin{verbatim}
+python3 golden_compare_all.py \
+  --savedmodel ../export_cnn_lstm/savedmodel_unroll \
+  --tflite ../finale/qbench_sweep_20251027_165731/experiments/mt2000_b0p5/tflite/model_int8_full.tflite \
+  --csv /home/projects/safe/data/processed-datasets/processed_streaming_row_continuous.csv \
+  --start 0 --stm32 outINT8.txt
+\end{verbatim}
+Codice principale dell'operatore python di confronto:
+
+\begin{lstlisting}[language=Python]
+# 3) Esegui Keras (float)
+yk, ms_k = run_keras(args.savedmodel, Xf)
+yk = flatten_last(yk)
+print(f"[KERAS] out: {yk.shape}   range={brief_rng(yk)}  ~{ms_k:.3f} ms/finestra")
+
+# 4) Esegui TFLite (int8 -> dequant)
+(in_scale, in_zp), (out_scale, out_zp) = get_tfl_qparams(args.tflite)
+print(
+    f"[TFLITE] qparams: IN(scale={in_scale:.9f}, zp={in_zp}) "
+    f"OUT(scale={out_scale:.9f}, zp={out_zp})"
+)
+yt, ms_t = run_tflite_quantized(args.tflite, Xf, threads=args.threads)
+yt = flatten_last(yt)
+print(f"[TFLITE] out: {yt.shape}   range={brief_rng(yt)}  ~{ms_t:.3f} ms/finestra")
+
+# 5) Delta TFLite vs Keras (questo è il tuo "errore di quantizzazione" target)
+mse_t, mae_t, maxe_t = metrics(yk, yt)
+print(f"\nΔ TFLite vs Keras  ->  MSE={mse_t:.6e}   MAE={mae_t:.6e}   MAX={maxe_t:.6e}")
+
+# 6) (opzionale) STM32
+if args.stm32:
+    arr = read_stm32_file(args.stm32)
+    if arr.size < 160:
+        raise RuntimeError("STM32 file ha solo {arr.size} valori, servono almeno 160.")
+    ystm = arr[:160].reshape(1, 160).astype(np.float32)  # già dequantizzati se usi (q8 - zp)*scale in firmware
+    print(f"[STM32] out: {ystm.shape}   range={brief_rng(ystm)}")
+
+    mse_s, mae_s, maxe_s = metrics(yk, ystm)
+    print(f"\nΔ STM32 vs Keras  ->  MSE={mse_s:.6e}   MAE={mae_s:.6e}   MAX={maxe_s:.6e}")
+\end{lstlisting}
+Ricordando che TFLite vs Keras (test precedente) avevamo: 
+
+\begin{itemize}
+    \item $\Delta$ MSE=0.1399
+    \item MAE=0.2833
+    \item MAX=1.1709 
+    \item Range: Keras [-0.436, 1.136] \quad TFLite [-0.677, 2.290].
+\end{itemize}
+Confrontando con l’output del TFLite caricato su STM32U545RE ($\Delta$ STM32 vs Keras): 
+
+\begin{itemize}
+    \item MSE=0.1449
+    \item MAE=0.3280
+    \item MAX=0.7277
+    \item Range [-0.833, 1.093].
+\end{itemize}
+
+\begin{lstlisting}[language=bash]
+[KERAS] out: (1, 160)   range=[-0.436, 1.136]   ~66.198 ms/finestra
+INFO: Created TensorFlow Lite XNNPACK delegate for CPU.
+[TFLITE] qparams: IN(scale=0.170490965, zp=-20)  OUT(scale=0.052055813, zp=62)
+[TFLITE] out: (1, 160)   range=[-0.677, 2.290]   ~0.109 ms/finestra
+
+Δ TFLite vs Keras  ->  MSE=1.399142e-01   MAE=2.833285e-01   MAX=1.170894e+00
+[STM32] out: (1, 160)   range=[-0.833, 1.093]
+
+Δ STM32 vs Keras  ->  MSE=1.449176e-01   MAE=3.280466e-01   MAX=7.277197e-01
+\end{lstlisting}
+Qualcosa non torna:
+
+\begin{itemize}
+    \item Non abbiamo mai usato RMSE nei confronti, normalmente si utilizza.
+    \item Il tflite migliore secondo i dati statistici dovrebbe essere 500/0.6 nonostante sia borderline con le finestre di ingresso guardando la letteratura. Controlliamo più a fondo se effettivamente non ha punti deboli e, in caso affermativo, utilizzeremo questo (Guarderemo range per clipping e eventuale peso effettivo in kB)
+    \item Tecnicamente il tflite ``raw'' e quello caricato su board dovrebbero produrre stesso output. Purtroppo così non è: basta leggere i risultati sopra. Non ci si aspetta l'allineamento matematico, ma al massimo un piccolo scarto dovuto ad arrotondamenti (piccoli!) interni dovuti a xcube-AI.
+\end{itemize}
+
+\subsubsection{Aggiunta di colonne RMSE e Range}
+Partiamo con le prime analisi. Questa volta, nella grande tabella aggiungeremo altre colonne: una per RMSE, un'altra per i range, e quelle ausiliarie.
+Utilizzeremo il seguente codice aggiuntivo:
+
+\begin{lstlisting}[language=Python]
+res = {
+    "yk_min": np.nan, "yk_max": np.nan,
+    "yt_min": yt_min, "yt_max": yt_max,
+    "delta_range_obs": np.nan,
+    "sat_lo_cnt": sat_lo, "sat_hi_cnt": sat_hi,
+    "repr_out_min": repr_min, "repr_out_max": repr_max,
+    "repr_out_width": repr_width, "lsb_out": out_scale,
+    "in_scale": in_scale, "in_zp": int(in_zp),
+    "out_scale": out_scale, "out_zp": int(out_zp),
+    "tflite_ms_observed": ms_t, "n_windows_eval": int(k)
+}
+
+if savedmodel:
+    savedmodel_path = resolve_path(savedmodel, base_dir)
+    Yk, ms_k = run_keras(str(savedmodel_path), Xf)
+    yk_min, yk_max = brief_rng(Yk)
+    mse_t, mae_t, maxe_t = metrics(Yk, Yt)
+    res.update({
+        "yk_min": yk_min, "yk_max": yk_max,
+        "delta_range_obs": (yt_max - yt_min) - (yk_max - yk_min),
+        "delta_mse_obs": mse_t, "delta_mae_obs": mae_t,
+        "delta_rmse_obs": math.sqrt(max(0.0, mse_t)),
+        "delta_max_obs": maxe_t,
+        "keras_ms_observed": ms_k
+    })
+
+return res
+\end{lstlisting}
+
+A questo punto abbiamo una tabella piu completa, anche se nessun ribaltamento di risultato per nessuna versione dovuta ai range: i modelli più performanti sono \textbf{tutti senza clipping}. 500/0.6 in cima alla lista. Useremo questo, anche perchè vediamo che non ci sono problemi.
+
+\subsubsection{Sistemazione tflite ``raw'' e su STM}
+Ora analizziamo invece cos'è successo per avere risultati diversi provenire dallo stesso tflite runnato in due posti diversi (PC e Board). Dopo un'attenta analisi:
+
+\begin{lstlisting}[language=C]
+/* BEGIN patch main.c - rimuovi clamp z-score */
+// opzionale: clamp 0..1 -> NO
+for (int i=0;i<16;i++) {
+    if (v[i] < 0.f) v[i] = 0.f;
+    if (v[i] > 1.f) v[i] = 1.f;
+}
+/* END patch main.c */
+\end{lstlisting}
+
+Questo clamping serviva in precedenza per testare finestre non z-score. Ripetiamo l’esperimento e stando attenti a runnare il modello attuale, grazie all’osservazione del report .elf o tramite la presenza di:
+
+\begin{verbatim}
+#define AI_NETWORK_ORIGIN_MODEL_NAME "model_int8_500"
+\end{verbatim}
+
+Ora migliorando la stampa in un csv (presente in pandora) abbiamo il seguente (ottimo!) risultato, in linea con quello che ci aspettavamo (confronto STM – tflite raw):
+
+\begin{itemize}
+    \item $\Delta$MSE = +0.00791
+    \item $\Delta$RMSE = +0.01099
+    \item $\Delta$MAE = +0.00221
+    \item $\Delta$MAX = +0.05174
+\end{itemize}
+Ma \textbf{MAX}: ($\approx$ 1 LSB, con OUT\_SCALE $\approx$ 0.05173)
+L’LSB (Least Significant Bit) rappresenta il \textit{minimo passo di quantizzazione}, pari al valore di ``scale'' del tensore. Secondo Tflite Quantization Spec, qualsiasi differenza $\leq$ 1 LSB è considerata ``bit-exact within quantization precision''. Pertanto, modelli tflite con scarto nel parametro MAX in intorno di 1LSB sono da considerarsi \textit{equipollenti}. Gli altri, per pura matematica, sono differenze impercettibili.
+
+\section{Sezione 6 -- Deployment}
+
+\subsection{Cablaggio MCU - Dongle}
+
+Ricordandoci lo schema chiarito nello scorso paragrafo, ora dobbiamo utilizzare i cavetti per collegare MCU con il \textbf{dongle}, adottando il tranceiver lato MCU per la traduzione USART TX/RX a RS485, standard del dongle (e industriale). 
+\subsubsection{Scelta dei pin}
+Per prima cosa, decidiamo i PIN lato MCU: TX e RX verranno mappati su PA2 e PA3 rispettivamente (Arduino D1 e D0). Ci servirà il toggle per decidere chi trasmette tra i due, e scegliamo PA1 come GPIO Output (Arduino A1). Da notare che questi sono \textit{LPUART1} come interfaccia (e non USART, che teniamo comunque accesa).
+\subsubsection{Collegamenti}
+Ora colleghiamo RX a RO sul tranceiver, TX a DI, GPIO a RSE (in alcuni tranceiver si ha una coppia al posto di RSE, unire insieme) e 3.3V a VCC. 
+Infine, Dal dongle colleghiamo A cin A e B con B sul tranceiver. Nota finale: Ground di tranceiver e Dongle collegati a GND separati sulla MCU. 
+\subsubsection{Schema}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+    pinlabel/.style={font=\small},
+    block/.style={draw, rounded corners,
+                  minimum width=2.6cm, minimum height=1.8cm,
+                  align=center},
+    >=stealth
+]
+
+% --- MONITOR ---
+\node[block] (monitor) at (0,0) {INFERENCE};
+\node[pinlabel,anchor=south] at ([yshift=2mm]monitor.north) {MONITOR};
+
+% --- BOARD ---
+\node[block] (board) at (4,0) {MODEL};
+\node[pinlabel,anchor=south] at ([yshift=2mm]board.north) {BOARD};
+
+% OUT
+\node[pinlabel] at (2,0.9) {OUT};
+\draw[->] ([xshift=-0.1cm]board.west) -- ([xshift=0.1cm]monitor.east);
+
+\end{tikzpicture}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+    pinlabel/.style={font=\small},
+    block/.style={draw, rounded corners,
+                  minimum width=2.3cm, minimum height=6cm,
+                  align=center},
+    >=stealth
+]
+
+% distanza orizzontale tra blocchi e frecce
+\def\wiregap{1.0cm}
+
+% distanza verticale tra le righe
+\def\rowA{2cm}
+\def\rowB{0.7cm}
+\def\rowC{-0.7cm}
+\def\rowD{-2cm}
+
+% --- BOARD ---
+\node[block] (board) at (0,0) {MODEL};
+\node[pinlabel,anchor=south] at ([yshift=2mm]board.north) {BOARD};
+
+% --- TRANSCEIVER ---
+\node[block] (trans) at (6,0) {};
+\node[pinlabel,anchor=south] at ([yshift=2mm]trans.north) {TRANSCEIVER};
+
+% --- DONGLE ---
+\node[block,minimum width=2.3cm] (dongle) at (12,0) {};
+\node[pinlabel,anchor=south,align=center]
+  at ([yshift=2mm]dongle.north) {DONGLE};
+
+% --- BOARD → TRANSCEIVER ---
+\draw[->] ([xshift=\wiregap,yshift=\rowA]board.east)
+          -- ([xshift=-\wiregap,yshift=\rowA]trans.west)
+          node[pinlabel,above,pos=0] {Tx}
+          node[pinlabel,above,pos=1] {DI};
+
+\draw[<-] ([xshift=\wiregap,yshift=\rowB]board.east)
+          -- ([xshift=-\wiregap,yshift=\rowB]trans.west)
+          node[pinlabel,above,pos=0] {Rx}
+          node[pinlabel,above,pos=1] {RO};
+
+\draw[->] ([xshift=\wiregap,yshift=\rowC]board.east)
+          -- ([xshift=-\wiregap,yshift=\rowC]trans.west)
+          node[pinlabel,above,pos=0] {TOGGLE}
+          node[pinlabel,above,pos=1,align=center] {RE/DE\\EN};
+
+\draw      ([xshift=\wiregap,yshift=\rowD]board.east)
+          -- ([xshift=-\wiregap,yshift=\rowD]trans.west)
+          node[pinlabel,above,pos=0] {GND}
+          node[pinlabel,above,pos=1] {GND};
+
+% --- TRANSCEIVER → DONGLE ---
+\draw[<-] ([xshift=\wiregap,yshift=\rowA]trans.east)
+          -- ([xshift=-\wiregap,yshift=\rowA]dongle.west)
+          node[pinlabel,above,pos=0] {A}
+          node[pinlabel,above,pos=1] {A};
+
+\draw[<-] ([xshift=\wiregap,yshift=\rowB]trans.east)
+          -- ([xshift=-\wiregap,yshift=\rowB]dongle.west)
+          node[pinlabel,above,pos=0] {B}
+          node[pinlabel,above,pos=1] {B};
+
+\draw      ([xshift=\wiregap,yshift=\rowC]trans.east)
+          -- ([xshift=-\wiregap,yshift=\rowC]dongle.west)
+          node[pinlabel,above,pos=0] {GND}
+          node[pinlabel,above,pos=1] {GND};
+
+\end{tikzpicture}
+\end{figure}
+
+
+
+
+
+
+\subsubsection{Implementazione a livello di codice}
+Basterà implementare LPUSART, e aggiungere la trasmissione RS485 con guard time:
+
+\begin{lstlisting}[language=C]
+static inline void RS485_RX(void) { HAL_GPIO_WritePin(RS485_DE_GPIO_Port, RS485_DE_Pin, GPIO_PIN_RESET); }
+static inline void RS485_TX(void) { HAL_GPIO_WritePin(RS485_DE_GPIO_Port, RS485_DE_Pin, GPIO_PIN_SET); }
+\end{lstlisting}
+
+\begin{lstlisting}[language=C]
+void log_rs485(const char* s) {
+    RS485_TX();
+    HAL_UART_Transmit(&hlpuart1, (uint8_t*)s, strlen(s), HAL_MAX_DELAY);
+    // aspetta fine TX per non tagliare l'ultima byte prima di tornare in RX
+    while ( HAL_UART_GET_FLAG(&hlpuart1, UART_FLAG_TC) == RESET ) {}
+    RS485_RX();
+}
+\end{lstlisting}
+
+E portare semplicemente ogni altro print su LPUART, come ad esempio:
+
+\begin{lstlisting}[language=C]
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == LPUART1) {
+        char c = (char)rx_byte;
+
+        if (c == '\n') {
+            if (rx_len > 0 && !line_ready) {
+                rx_line[rx_len] = '\0';
+                line_ready = 1;
+            }
+            rx_len = 0;
+        } else if (c != '\r') {
+            if (rx_len < sizeof(rx_line)-1) rx_line[rx_len++] = c;
+            else rx_len = 0; // overflow -> reset
+        }
+
+        HAL_UART_Receive_IT(&hlpuart1, &rx_byte, 1);
+    }
+}
+\end{lstlisting}
+
+
+\subsection{Standardizzazione on-demand}
+
+\subsubsection{Recuper dei valori di conversione}
+Ora che abbiamo verificato i cablaggi ed è tutto pronto, dobbiamo prima modificare il \textit{core MCU} in modo che possa effettivamente procedere \textit{lui} alla standardizzazione dei dati in ingresso. Questo poichè, ovviamente, i dati saranno resi disponibili in formato ``raw'' e non prestandardizzati come ora.
+Procediamo dunque a recuperare i \textit{valori di standardizzazione} per il nostro modello. Ricordando che la combinazione è 500/0.6, andiamo della cartella dell'esperimento in esame e apriamo \texttt{rep\_balance\_stats.json}. Verrà esposto:
+
+\begin{verbatim}
+"scaler": {
+  "mean": [ . . . ],
+  "scale": [ . . . ],
+  ...
+}
+\end{verbatim}
+
+\subsubsection{Implementazione}
+Creiamo dunque due array \texttt{MEAN[FEAT]} \texttt{STD[FEAT]} in xcubeAI e utilizziamo il seguente for dentro la funzione di \texttt{push\_line\_16}:
+
+\begin{lstlisting}[language=C]
+int ai_push_line_of_16(const float v[FEAT]) {
+    if (w_count < WIN) {
+        // Standardizza ogni feature: z = (x - μ) / σ
+        for (int i = 0; i < FEAT; i++) {
+            window[w_count][i] = (v[i] - MEAN[i]) / STD[i];
+        }
+        w_count++;
+    }
+}
+\end{lstlisting}
+
+\subsubsection{Osservazioni}
+A questo punto non ci resta che confermare la correttezza del codice. Confronteremo le finestre standardizzate dall'MCU e quelle dello standardizer esterno (script python precedente) che generava la finestra pronta. Il codice è identico. Infatti, l'output prodotto dall'MCU è lo stesso. Usare sempre lo stesso \texttt{invio.py} ma con la nuova finestra.
+
+\textbf{NOTA IMPORTANTE}:
+Prima, avevamo estratto una finestra dopo l'applicazione dello standard scaler. Per rischi di precisione, abbiamo creato uno script di generazione finestra RAW e corrispondente Standard (insieme) per operare con le due versioni. In questo modo abbiamo il tester completo, altrimenti avremo dovuto invertire la finestra già standardizzata che avevamo prima ma, di nuovo, rischiavamo la precisione.
+
+\begin{lstlisting}
+┌──────────────────────────────────────────────────────────────────────┐
+│ STM32U545RE - SAFE Predictive Maintenance System                    │
+│ Firmware v2.1 - MODBUS RTU + ON-BOARD STANDARDIZATION               │
+├──────────────────────────────────────────────────────────────────────┤
+│ Model: CNN+LSTM mt500_b0p6 (INT8, 141.99 KB)                        │
+│ Input: 30x16 RAW → Z-Score → Quantized INT8                         │
+│ Protocol: Modbus RTU (9600 baud, 8N1)                               │
+└──────────────────────────────────────────────────────────────────────┘
+
+[MODE] Modbus RTU - Listening on RS-485...
+\end{lstlisting}
+
+\section{Sezione 7 -- Implementazione Modbus RTU}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{c c c c c c}
+\multicolumn{6}{c}{\textbf{Modbus RTU Frame Format}}\\[4pt]
+\textbf{Start} & \textbf{Address} & \textbf{Function} & \textbf{Data} & \textbf{CRC} & \textbf{End} \\
+$\geq$3.5 char & 8 bit & 8 bit & $N \cdot 8$ bit & 16 bits & $\geq$3.5 char \\
+\\
+\multicolumn{6}{c}{\textbf{Modbus ASCII Frame Format}}\\[4pt]
+\textbf{Start} & \textbf{Address} & \textbf{Function} & \textbf{Data} & \textbf{LRC} & \textbf{End} \\
+; & 2 chars & 2 chars & $N \cdot 1$ chars & 2 chars & CR, LF \\
+\end{tabular}
+\end{table}
+
+\subsection{Teoria e schema iniziale}
+
+L'ultimo e importante step è quello di adottare uno standard \textit{industriale comune} (e utilizzato dal sensore di Bonfiglioli) per la lettura dei dati del sensore. Per ora, abbiamo usato un semplice file python di invio tramite ASCII. 
+Partiamo dunque dal precisare che Bonfiglioli ha i due z-sensors 'slaves' collegati a un master che ne legge i valori. Noi dovremo collegare la MCU ad esso (come \textit{slave}) e sniffarne i valori, per poi procedere con la pipeline. Da notare che lo standard è binario, con il seguente schema:
+
+\begin{verbatim}
+[ADDR][FUNC][LEN][PAYLOAD][CRC_LOW][CRC_HIGH]
+\end{verbatim}
+
+\begin{itemize}
+    \item 
+    \item ADDR = indirizzo dello slave (1 byte)
+    \item FUNC = function code (1 byte)
+    \item LEN = numero di byte del payload (1 byte)
+    \item PAYLOAD = dati veri e propri
+    \item CRC16 = checksum finale (2 byte, little-endian)
+\end{itemize}
+Useremo, in ordine: 
+
+\begin{itemize}
+    \item 0x01 (arbitrario)
+    \item 0x03 (Read Holding Registers)
+    \item 0x040 (64 in decimale, 16 valori float (4byte ciascuno) $\rightarrow$ 64 bytes)
+    \item 64 blocks scritti byte per byte in big endian (+significativo per primo)
+    \item CRC L/H standard per checksum
+\end{itemize}
+Nota: Questo payload è custom. Ovvero, i registri modbus sono da 16 bit (2byte), non conosce i float. Quindi ogni float verrà spezzato in \textbf{due parti separate} cosi da poter essere inviato. Non sappiamo precisamente il perchè i dati sul csv siano tutti float, nonostante si utilizzi modbus RTU standard. 
+
+\textbf{DUBBIO 1 $\rightarrow$ COME INVIANO LORO QUESTI FLOAT (SE INVIANO FLOAT)? CUSTOM? }
+
+\subsubsection{Master-Simulator}
+Stabilito quindi il funzionamento dell'invio, implementiamolo in uno script che simula un master \textit{pubblicante quei valori} a cui si può accedere tramite collegamento TX/RX.
+
+\begin{lstlisting}[language=Python]
+def modbus_crc16(data):
+    """Calcola CRC16 Modbus (polinomio 0xA001)"""
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            if crc & 0x0001:
+                crc >>= 1
+                crc ^= 0xA001
+            else:
+                crc >>= 1
+    return crc
+
+
+def build_modbus_frame(slave_addr, function_code, float_values):
+    """
+    Costruisce frame Modbus RTU con array di float32
+
+    Struttura:
+    [ADDR] [FUNC] [LEN] [DATA...] [CRC_LO] [CRC_HI]
+    """
+    # Header
+    frame = bytearray()
+    frame.append(slave_addr)
+    frame.append(function_code)
+    frame.append(len(float_values) * 4)  # Data length in bytes
+
+    # Data: float32 big-endian
+    for value in float_values:
+        frame.extend(struct.pack('>f', value))  # '>f' = big-endian float
+
+    # CRC16 (little-endian sui 2 bytes finali)
+    crc = modbus_crc16(frame)
+    frame.append(crc & 0xFF)         # CRC Low
+    frame.append((crc >> 8) & 0xFF)  # CRC High
+
+    return bytes(frame)
+\end{lstlisting}
+
+\subsubsection{Lettura da CSV}
+leggiamo il CSV e apriamo la porta:
+
+\begin{lstlisting}[language=Python]
+# Carica dati RAW
+print(f"[*] Caricamento dati da {csv_file}...")
+df = pd.read_csv(csv_file, header=None)
+print(f"[OK] Caricati {len(df)} campioni x {df.shape[1]} features")
+
+# Apri porta seriale
+print(f"[*] Apertura porta {port} @ {baud} baud...")
+ser = serial.Serial(port, baud, bytesize=8, parity=serial.PARITY_NONE,
+                    stopbits=1, timeout=TIMEOUT)
+time.sleep(0.5)  # Stabilizzazione
+print(f"[OK] Porta aperta\n")
+\end{lstlisting}
+
+\subsubsection{Invio continuo}
+All'interno di un while true incapsuliamo l'invio alternato da uno sleep finale dopo il log (non mostrato ma presente subito dopo):
+
+\begin{lstlisting}[language=Python]
+for idx, row in df.iterrows():
+    # Estrai 16 features RAW
+    float_values = row.values[:16].tolist()
+
+    # Costruisci frame Modbus RTU
+    frame = build_modbus_frame(SLAVE_ADDR, FUNCTION_CODE, float_values)
+
+    # Calcola CRC per verifica
+    crc_computed = modbus_crc16(frame[:-2])
+    crc_frame = frame[-2] | (frame[-1] << 8)
+
+    # Invia frame
+    ser.write(frame)
+    frame_count += 1
+\end{lstlisting}
+
+\subsection{Ricezione dei dati lato MCU}
+
+\subsubsection{Callback}
+Per prima cosa prepariamo l'MCU a eseguire la seguente callback in \texttt{main.c} ad ogni byte ricevuto.
+
+\begin{lstlisting}[language=C]
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+    if (huart->Instance == LPUART1) {
+
+        if (protocol_mode == PROTOCOL_MODE_MODBUS) {
+
+            // NO LOGS HERE, ONLY NECESSARY F's
+            uint32_t now = HAL_GetTick();
+            modbus_rx_buffer[modbus_rx_head] = rx_byte;
+            modbus_rx_timestamps[modbus_rx_head] = now;
+            modbus_rx_head = (modbus_rx_head + 1) % MODBUS_RX_BUFFER_SIZE;
+            modbus_last_rx_time = now;
+
+        } else {
+            // ...
+        }
+    }
+}
+\end{lstlisting}
+
+In particolare, ad ogni interrupt: 
+
+\begin{itemize}
+    \item salva il byte in \texttt{modbus\_rx\_buffer[]} (buffer CIRCOLARE),
+    \item salva anche timestamp in \texttt{modbus\_rx\_timestamps[]} (sempre CIRCOLARE),
+    \item avanza l’indice di \texttt{modbus\_rx\_buffer[]} (stesso di \texttt{modbus\_rx\_timestamps[]}),
+    \item riarma subito \texttt{HAL\_UART\_Receive\_IT} in attesa della prossima interruzione.
+\end{itemize}
+
+DUBBIO 2 $\rightarrow$ L'indice cresce linearmente ma potrebbe toccare il fondo del float se mai resettato. Da modificare.
+
+\subsubsection{Consumo dei buffer}
+Dopo, nel demone, consumiamo i 2 buffers con la logica proximity: finché la coda del buffer principale non coincide con la testa, ci sono byte in mezzo da processare (e di conseguenza pure nei timestamp, che è indicizzato con la stessa variabile del principale).
+
+Per farlo, occorre creare due nuovi moduli che permettono di organizzare il codice in modo chiaro: \texttt{app\_x-cube-ai.c/h} in \texttt{Core/Inc} (h) e \texttt{Core/Src} (c).
+
+\subsection{Moduli di appoggio per il processing Modbus RTU}
+
+Il file .c segue uno standard della community, ma vanno implementate ad hoc:
+
+\begin{itemize}
+    \item \texttt{modbus\_process\_byte()} : prende un byte alla volta con timestamp, riconosce la sequenza binaria decisa all'inizio e torna 1 se completo (quindi si potrà proseguire con l'estrazione del payload tramite altre funzioni)
+    \item \texttt{modbus\_get\_frame()} : copia fuori il frame riconosciuto 
+    \item \texttt{modbus\_extract\_float32()} : estrae il payload di 16 float
+\end{itemize}
+
+Nota: ogni funzione ovviamente non è bloccante, ma skippa blocchi successivi e torna nello stesso punto (polling) finchè non rispettano la condizione.
+
+DUBBIO 3 $\rightarrow$ Stiamo wrappando Modbus in realtà, di solito andrebbero implementate anche le funzioni di logica registri e crc.
+
+\subsubsection{modbus_process_byte}
+\begin{lstlisting}[language=C]
+bool modbus_process_byte(modbus_rx_buffer_t *buf,
+                         uint8_t byte,
+                         uint32_t timestamp_ms)
+{
+    if (!buf) return false;
+
+    // Framing senza timing:
+    switch (buf->sync_stage) {
+
+    case 0: // Attendi indirizzo
+        if (byte == MODBUS_SLAVE_ADDR) {
+            buf->buffer[0] = byte;
+            buf->index = 1;
+            buf->sync_stage = 1;
+            buf->state = MODBUS_STATE_RECEIVING;
+        } else {
+            // scarta
+            buf->index = 0;
+        }
+        break;
+
+    case 1: // Attendi function code
+        if (byte == MODBUS_FUNCTION_CODE) {
+            buf->buffer[1] = byte;
+            buf->index = 2;
+            buf->sync_stage = 2;
+        } else {
+            // restart sync
+            buf->sync_stage = 0;
+            buf->index = 0;
+        }
+        break;
+
+    case 2: // Attendi LEN
+        buf->buffer[2] = byte;
+        buf->index = 3;
+        if (byte == 0 || byte > MODBUS_MAX_DATA_LEN) {
+            // len non valido -> reset
+            modbus_reset(buf);
+        } else {
+            buf->bytes_needed = (uint16_t)byte + 2; // payload + CRC16
+            buf->sync_stage = 3;
+        }
+        break;
+
+    case 3: // payload+CRC
+        if (buf->index < MODBUS_FRAME_MAX_SIZE) {
+            buf->buffer[buf->index++] = byte;
+            if (buf->bytes_needed > 0) {
+                buf->bytes_needed--;
+            }
+            if (buf->bytes_needed == 0) {
+                // Frame completo!
+                buf->state = MODBUS_STATE_COMPLETE;
+                buf->sync_stage = 0;
+                return true;
+            }
+        } else {
+            // overflow -> reset
+            modbus_reset(buf);
+        }
+        break;
+
+    default:
+        modbus_reset(buf);
+        break;
+    }
+
+    buf->last_rx_time = timestamp_ms;
+    return false;
+}
+\end{lstlisting}
+
+\subsubsection{modbus_get_frame}
+\begin{lstlisting}[language=C]
+bool modbus_get_frame(modbus_rx_buffer_t *buf, modbus_frame_t *frame)
+{
+    if (!buf || !frame || buf->state != MODBUS_STATE_COMPLETE) {
+        return false;
+    }
+
+    // Parsing frame
+    if (buf->index < 5) {
+        modbus_reset(buf);
+        return false;
+    }
+
+    frame->address  = buf->buffer[0];
+    frame->function = buf->buffer[1];
+
+    // Per Function Code 0x03 (Read Holding Registers):
+    // Byte 2 = data length
+    if (frame->function == 0x03) {
+        frame->data_len = buf->buffer[2];
+
+        if (frame->data_len > MODBUS_MAX_DATA_LEN ||
+            buf->index < (3 + frame->data_len + 2)) {
+            // Frame malformato
+            modbus_reset(buf);
+            return false;
+        }
+
+        // Copia dati
+        memcpy(frame->data, &buf->buffer[3], frame->data_len);
+
+        // CRC16 (ultimi 2 bytes, little-endian)
+        uint16_t crc_offset = 3 + frame->data_len;
+        frame->crc16_rx = (uint16_t)buf->buffer[crc_offset] |
+                          ((uint16_t)buf->buffer[crc_offset + 1] << 8);
+
+        // Calcola CRC sui dati (esclusi CRC bytes)
+        frame->crc16 = modbus_crc16(buf->buffer, crc_offset);
+
+        // Verifica CRC
+        frame->valid = (frame->crc16 == frame->crc16_rx);
+
+        // Copia raw frame
+        frame->raw_len = buf->index;
+        memcpy(frame->raw, buf->buffer, buf->index);
+
+    } else {
+        // Function code non supportato (per ora)
+        frame->valid = false;
+    }
+
+    // Resetta buffer per prossimo frame
+    modbus_reset(buf);
+
+    return frame->valid;
+}
+\end{lstlisting}
+
+\subsubsection{modbus_extract_float32}
+\begin{lstlisting}[language=C]
+int modbus_extract_float32(const modbus_frame_t *frame,
+                           float *output,
+                           int max_count)
+{
+    if (!frame || !output || !frame->valid) {
+        return 0;
+    }
+
+    // Verifica che data len sia multiplo di 4 (float32 = 4 bytes)
+    if (frame->data_len % 4 != 0) {
+        return 0;
+    }
+
+    int float_count = frame->data_len / 4;
+    if (float_count > max_count) {
+        float_count = max_count;
+    }
+
+    for (int i = 0; i < float_count; i++) {
+        output[i] = bytes_to_float32_be(&frame->data[i * 4]);
+    }
+
+    return float_count;
+}
+\end{lstlisting}
+
+\subsection{Main loop (main.c demon)}
+
+Qui, come accennato prima dello scorso paragrafo, useremo le funzioni appena implementate.
+
+\subsubsection{Main loop}
+\begin{lstlisting}[language=C]
+while (1) {
+
+    // === MODBUS RTU ===
+    if (protocol_mode == PROTOCOL_MODE_MODBUS) {
+
+        // Process bytes
+        while (modbus_rx_tail != modbus_rx_head) {
+            uint8_t  byte      = modbus_rx_buffer[modbus_rx_tail];
+            uint32_t timestamp = modbus_rx_timestamps[modbus_rx_tail]; // Timestamp
+            modbus_rx_tail = (modbus_rx_tail + 1) % MODBUS_RX_BUFFER_SIZE;
+
+            if (modbus_process_byte(&modbus_buf, byte, timestamp)) {
+                // Frame completed!
+                modbus_frame_t frame;
+                if (modbus_get_frame(&modbus_buf, &frame)) {
+                    // filter address and f code
+                    if (frame.valid &&
+                        frame.address == MODBUS_SLAVE_ADDR &&
+                        frame.function == MODBUS_FUNCTION_CODE) {
+
+                        // 16 float32 RAW
+                        float raw_features[16];
+                        int count = modbus_extract_float32(&frame,
+                                                           raw_features, 16);
+
+                        if (count == 16) {
+                            // Push model with standard included
+                            ai_push_line_of_16(raw_features);
+
+                            // Log on VCP
+                            static uint32_t good_frames = 0;
+                            good_frames++;
+                            char line[64];
+                            snprintf(line, sizeof(line),
+                                     "[MODBUS] Frame OK #%lu (len=%u)\r\n",
+                                     good_frames, frame.data_len);
+                            log_vcp(line);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+\end{lstlisting}
+
+\begin{itemize}
+    \item Consumo byte dal buffer circolare tramite \texttt{modbus\_process\_byte()} + proximity e, appena la funzione torna 1, l'insieme di byte ha senso 
+    \item Copio il frame sensato con \texttt{modbus\_get\_frame()} (controllo inoltre se il frame è valido)
+    \item Estraggo il payload con \texttt{modbus\_extract\_float32()}
+\end{itemize}
+
+\subsubsection{Push}
+A questo punto posso fare push: chiamo \texttt{ai\_push\_line\_of\_16()} passandogli il payload (una nuova riga). Chiamiamo xcubeai. Ricordando quindi la logica generale per non perderci. Parsiamo una riga in arrivo, e contemporaneamente:
+\begin{itemize}
+    \item La si mette dentro a una funzione che a sua volta ne chiama una in xcubeai (indipendente, nostra) che pusha la riga dentro una finestra. Se la variabile globale ``finestra'' sarà pronta, allora verrà settato a 1 un flag globale.
+    \item Si chiama lo standard processing di xcube ai che controlla il flag: se la finestra è pronta, standardizza e passa al modello.
+\end{itemize}
+
+Ovviamente ometto quest'ultima parte perchè gia mostrata in precedenza. La pipeline è dunque completa.
+
+\subsection{Test di funzionamento}
+
+Flashiamo su MCU il firmware sopradescritto, e apriamo la porta di debug:
+
+\begin{verbatim}
+screen /dev/ttyACM0 115200
+\end{verbatim}
+
+Poi inviamo:
+
+\begin{verbatim}
+python modbus_simulator.py win_raw.csv 2.0
+\end{verbatim}
+
+L'inferenza viene \textbf{correttamente} visualizzata a display:
+
+\begin{lstlisting}[language=bash]
+[TX #0029] Row 29/30 | Frame: 69 bytes | CRC: 0x57d2  ✅
+Sample: [3.427, -0.191, 0.884, ..., 52.500]
+Hex: 01 03 40 40 5b 20 43 be 4a ...
+
+[TX #0030] Row 30/30 | Frame: 69 bytes | CRC: 0x2c16  ✅
+Sample: [3.638, -0.246, 0.915, ..., 52.750]
+Hex: 01 03 40 6b d8 0e 44 0b ...
+
+[INFO] Fine iterazione 1. Ricomincio...
+
+[ITERATION 2] Starting...
+[TX #0031] Row  1/30 | Frame: 69 bytes | CRC: 0x6787  ✅
+...
+
+[MODBUS] Frame OK #1  (len=64)
+[MODBUS] Frame OK #2  (len=64)
+[MODBUS] Frame OK #3  (len=64)
+...
+[MODBUS] Frame OK #29 (len=64)
+
+[AI] *** FINESTRA 30/30 COMPLETA -> INFERENZA ***
+[AI] Inference done. Q->F:
+0.104 -0.104 0.677 -0.156 0.989 2.290 0.989 0.521 0.416 0.104 ...
+...
+
+[AI] Window reset, ready for next 30 frames
+\end{lstlisting}
+
+\subsection{Errori durante il deployment}
+
+Per evitare confusione, mostro ora gli errori principali incontrati prima di arrivare alla pipeline corretta:
+
+\begin{itemize}
+    \item Utilizzo del modello 2000/0.5 sia in network che nei std params. Risultato: Benchmarking \textbf{confuso}.
+    \item Finestra presa già poi ristandardizzata (Manteneva il vecchio codice). Medesimo risultato
+    \item Log dentro a una callback. Anche qui, un tipico errore che causa mancati arrivi sul buffer di ricezione (anche se l'invio è costante).
+    \item Python caricava in \textit{little endian}, ma si riceveva in big endian. Classico errore: non combaciava la fine della finestra.
+\end{itemize}
+\begin{center}
+    \textbf{Nota finale: pesano uguali i modelli}
+\end{center}
+
+\section{Domande}
+\begin{itemize}
+    \item[] $\rightarrow$ DOMANDA: ABBIAMO INCLUSO LE CODE IN TRAINING. RISCHIO DI NON RICONOSCERLE
+    \item[] trainingincluselecode-colonne16
+    \item Training fatto su 80\% affidabilit
+    \item Indirizzi modbus
+\end{itemize}
+
+
+\section*{Note finali importanti}
+
+\begin{itemize}
+    \item In questa Board è presente ICache oltre alla cache di prefetching, la quale conviene tenerla attivata fin da subito: farlo dal system core così verrà fatta la sua \texttt{init()} a inizio codice. Utilizzare la 2-way (column) per il nostro progetto, perchè non ci troveremo in una situazione di coding lineare ma diverse librerie + loops (+overhead ma +affidabile in miss)
+    \item Stare attenti nel while true a scrivere il codice nelle regioni giuste: non basta metterlo all'interno delle graffe. Ad ogni salvataggio, infatti, il codice rigenerato fuori dai commenti BEGIN\_END rischia di andare perso.
+    \item Il tasto di reset serve per far ripartire da 0 il main pulendo la RAM ma non la FLASH. Questo significa che il reset può essere fatto in serenità ogni qual volta si necessiti di pulizia di Cache/RAM, senza preoccuparsi di perdere alcun dato.
+\end{itemize}
+
+\section*{Note}
+
+Si è scelta l’architettura CNN al posto della SpikeNN per motivi pratici. Nonostante la SpikeNN sia più recente, performante e con meno consumi di risorse, il training risulta impegnativo e di difficile riuscita.
+
+\section*{Bibliografia}
+
+\begin{itemize}
+    \item Hochreiter, S.; Schmidhuber, J. (1997). Long Short-Term Memory. Neural Computation, 9(8), 1735–1780.
+    \item Malhotra, P.; Ramakrishnan, A.; Anand, G.; Vig, L.; Agarwal, P.; Shroff, G. (2016). LSTM-based Encoder–Decoder for Multi-sensor Anomaly Detection. arXiv:1607.00148.
+    \item Bai, S.; Kolter, J. Z.; Koltun, V. (2018). An Empirical Evaluation of Generic Convolutional and Recurrent Networks for Sequence Modeling. arXiv:1803.01271.
+    \item Zhang, C.; Song, D.; Chen, Y.; et al. (2019). MSCRED: A Deep Neural Network for Unsupervised Anomaly Detection and Diagnosis in Multivariate Time Series. AAAI 2019.
+    \item Zong, B.; Song, Q.; Min, M. R.; et al. (2018). Deep Autoencoding Gaussian Mixture Model for Unsupervised Anomaly Detection. ICLR 2018.
+    \item Su, Y.; Zhao, Y.; Niu, C.; et al. (2019). Robust Anomaly Detection for Multivariate Time Series through Stochastic RNN (OmniAnomaly). KDD 2019.
+    \item Xu, H.; Chen, W.; Zhao, N.; et al. (2018). Unsupervised Anomaly Detection via Variational Auto-Encoder for Seasonal KPIs in Web Applications (Donut). WWW 2018.
+    \item Bañós, O.; Gálvez, J.-M.; Damas, M.; Pomares, H.; Rojas, I. (2014). Window Size Impact in Human Activity Recognition. Sensors, 14(4), 6474–6499.
+    \item Ronao, C. A.; Cho, S.-B. (2016). Human Activity Recognition with Smartphone Sensors Using Deep Learning Neural Networks. Expert Systems with Applications, 59, 235–244.
+    \item Dehghani, A.; Nambiar, R.; Sharma, R.; et al. (2019). A Quantitative Comparison of Overlapping and Non-Overlapping Sliding Windows for HAR Using Inertial Sensors. Sensors, 19(22), 5026.
+    \item Randall, R. B.; Antoni, J. (2011). Rolling Element Bearing Diagnostics—A Tutorial. Mechanical Systems and Signal Processing, 25(2), 485–520.
+    \item Mohd Ghazali, M. H.; Rahiman, W. (2021). Vibration Analysis for Machine Monitoring and Diagnosis: A Systematic Review. Shock and Vibration, Article ID 9469318.
+\end{itemize}
+
+
