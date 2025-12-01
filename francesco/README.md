@@ -4,7 +4,7 @@ This repository collects everything built so far to train, quantize, benchmark, 
 
 ## Repository layout (what’s where)
 
-
+```
 SAFE
 ├── 06 francesco.tex
 ├── README.md
@@ -70,6 +70,7 @@ SAFE
 │   ├── compare_inference.py
 │   └── keras_inference.py
 └── Esp32/
+```
 
 ### Folder overview
 
