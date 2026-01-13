@@ -1,76 +1,12 @@
-\documentclass[12pt,a4paper]{article}
+\section{Francesco}\label{sec:francesco}
 
-% PACKAGES NECESSARI
-\usepackage[utf8]{inputenc}
-\usepackage[T1]{fontenc}
-\usepackage[english]{babel}
-\usepackage{geometry}
-\geometry{margin=2.5cm}
+% Encoding and language
 
-\usepackage{graphicx}
-\usepackage{tikz}
-\usetikzlibrary{positioning}
-
-\usepackage{amsmath, amssymb}
-\usepackage{booktabs}
-\usepackage{array}
-\usepackage{longtable}
-
-\usepackage{xcolor}
-\usepackage{listings}
-\usepackage{verbatim}
-\usepackage{caption}
-\usepackage{subcaption}
-
-\usepackage{hyperref}
-\hypersetup{colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue}
-
-\usepackage{setspace}
-\setstretch{1.3}
-
-% stile codice
-\lstdefinestyle{code}{
-    basicstyle=\ttfamily\small,
-    numbersep=6pt,
-    numbers=left,
-    stepnumber=1,
-    showstringspaces=false,
-    breaklines=true,
-    tabsize=2,
-    frame=single,
-    rulecolor=\color{black!20},
-    keywordstyle=\color{blue!70!black},
-    commentstyle=\color{green!40!black},
-    stringstyle=\color{red!60!black}
-}
-\lstset{style=code}
-
-% environment per cverbatim
 \newenvironment{cverbatim}
   {\begin{center}\begin{minipage}{0.7\linewidth}\begin{verbatim}}
   {\end{verbatim}\end{minipage}\end{center}}
 
-\title{Francesco Simoni}
-\begin{document}
-
-\begin{titlepage}
-		\centering
-		{\Huge\textbf{Anomaly Detection Project}}\\
-		\vspace{0.5cm}
-		{\Large 2025}\\
-		\vspace{8cm}\
-		{\LARGE \textbf{Quantization and Hardware Deployment Section}}\\
-		\vspace{0.5cm}
-		{\Large \textit{Technical report on developing, quantizing, and deploying a CNN/LSTM model on STM32 microcontrollers with serial and Modbus RTU integration.}}\\
-		\vspace{10cm}
-		{\large Francesco Simoni}
-	\end{titlepage}
-	
-	\newpage
-
-\tableofcontents
-\clearpage
-
+\nocite{*}
 \section{Section 1 -- Nucleo-F411RE/U545RE (MCU)}
 
 
@@ -93,7 +29,7 @@ At this point, still on Help $\rightarrow$ Conf tools $\rightarrow$ Manage … $
 \begin{table}[h]
 \centering
 \begin{tabular}{l l l l}
-\toprule
+    oprule
 Package & Installed version & Available version & Size \\
 \midrule
 MCU Package for STM32F4 Series & 1.28.3 & 1.28.3 & -- \\
@@ -214,6 +150,17 @@ For experimental reasons, it was decided to suspend the development on the much 
 Finally, the U5 series is specifically designed for the minimum indispensable consumption: in addition to the classic run/sleep/standby there are other \textit{energy saving} modes available. There is also a clock source Multi Speed Internal Oscillator MSIS which is specifically designed to operate in ultra low power.
 
 \subsection{Initial setup}
+
+\begin{figure}[!htbp]
+    \centering
+    \includegraphics[
+        angle=90,
+        width=0.60\textheight,
+        height=0.60\textwidth,
+        keepaspectratio
+    ]{assets/francesco/U545.jpg}
+    \caption{U545RE}
+\end{figure}
 
 Set the clock \textit{high} just to become familiar with the diagram of the internal sources.
 
@@ -1581,7 +1528,7 @@ The inference is \textbf{correctly} displayed on the console:
 
 \begin{lstlisting}[language=bash]
 
-[TX #0030] Row 30/30 | Frame: 69 bytes | CRC: 0x2c16  
+[TX #0030] Row 30/30 | Frame: 69 bytes | CRC: 0x2c16  ✅
 Sample: [3.638, -0.246, 0.915, ..., 52.750]
 Hex: 01 03 40 6b d8 0e 44 0b ...
 
@@ -1611,6 +1558,319 @@ To avoid confusion, we briefly list the main errors encountered before reaching 
     \textbf{Final note: the models have the same size.}
 \end{center}
 
+
+\section{Section 8 -- ESP32 Seco Board}
+
+
+\begin{figure}[!htbp]
+    \centering
+    \includegraphics[
+        angle=90,
+        width=0.60\textheight,
+        height=0.60\textwidth,
+        keepaspectratio
+    ]{assets/francesco/SECO.jpg}
+    \caption{Seco Setup}
+\end{figure}
+
+
+\subsection{Installation}
+First, Go on VSCode and install ESP32 IDF Estension, which suggest you to run this command:
+
+\begin{center}
+sudo apt-get install git wget flex ...
+\end{center}
+Save the new packages, if you want to delete them in the future:
+
+\begin{center}
+    bison ccache cmake cmake-data dfu-util flex gperf libffi-dev libfl-dev
+    libfl2 libhiredis1.1.0 libjsoncpp25 librhash0 libssl-dev m4 ninja-build
+    python3-venv
+\end{center}
+Fix the path for noble python3-venv if needed
+
+\begin{center}
+    sudo apt-get install --fix-missing
+    sudo apt-get install python3-venv
+\end{center}
+There will be 2 new file/folder
+
+\begin{center}
+    /home/.../esp
+    /home/.../.espressif
+\end{center}
+You can acess to the main page with New Proj | Import | Show examples... by clicking the extension in the left bar menu. The terminal here will use the esp/versionx/esp-idf/tools/idf.py executable. Let's read the SECO \textbf{board manual} of the EasyEdge. We see that it mount this chip:
+
+\begin{center}
+    \textit{ESP32-WROVER 3.3V}
+\end{center}
+So we have to create a new project using esp32 IDF target with this chip board and for now ttyUSB0 port (of the adapter). Before we get started, it would be necessary to explain the architecture scheme of this project:
+
+\begin{itemize}
+\item Sensor-side (USB-RS485-TTL) the pipeline is the same, a part of the mammut cable for male-male connectors.
+\item DBG/FLASH-side it's not available an USB direct connection. So, we will have a dongle USB-TTL going on different GPIO as explained in the manual.
+\end{itemize}
+Now we can load a simple hello world project, keeping in mind the correct pipeline
+
+\subsection{Deployment pipeline}
+
+\subsubsection{Flashing Mode}
+
+\begin{itemize}
+\item Connect EasyEdge to PC with USB-TTL (P6) with these jumpers:
+\end{itemize}
+\begin{center}
+JP3/JP8 \textbf{closed} → serial TTL | JP1 \textbf{closed} → bootloader | Others opened
+\end{center}
+\begin{itemize}
+\item Press the reset button
+\end{itemize}
+
+\subsubsection{Model Deployment}
+\begin{itemize}
+\item Select Port → /dev/ttyUSB0,
+\item Build, Flash
+\end{itemize}
+Or, from the terminal:
+
+\begin{center}
+    idf.py -p /dev/ttyUSB0 build flash
+\end{center}
+
+\subsubsection{Debug Mode}
+\begin{itemize}
+\item Open JP1 jumper
+\item Press the reset button
+\end{itemize}
+Run this command;
+\begin{center}
+    idf.py -p /dev/ttyUSB0 monitor
+\end{center}
+You will se the starting log. Now we can start converting the firmware from U545RE to ESP32.
+
+\subsection{Firmware Porting}
+
+\subsubsection{Important note}
+
+\begin{itemize}
+\item The python sending from the sensor dongle is the same, nothing to change
+\item The Model has to be converted manually by using the C command:
+\end{itemize}
+\begin{center}
+    \begin{verbatim}
+        xxd -i model_int8.tflite > model_data.cc
+    \end{verbatim}
+\end{center}
+\begin{itemize}
+\item We will also have to implement the onboard standardization
+\end{itemize}
+
+\subsubsection{ESP32 Model deployment}
+
+Let's add the TFLite Micro as a Component. Run this command on terminal:
+\begin{center}
+    idf.py add-dependency "esp-tflite-micro"
+\end{center}
+Now we can link tflite-micro. Then we show to the compiler the dependancy root on CMakeLists.txt(Yes, cpp and cc in the same component):
+
+\begin{lstlisting}[language=C]
+    idf_component_register(
+        SRCS
+        "main.c"
+        "safe_core.c"
+        "safe_uart.c"
+        "safe_ml.cpp"
+        "model_data.cc"
+        INCLUDE_DIRS "."
+        REQUIRES esp-tflite-micro
+    )
+\end{lstlisting}
+Entry point (main.c): initializes core/window manager, ML interpreter, and UART ingestion task, then idles while tasks run.
+
+\begin{lstlisting}[language=C]
+void app_main() {
+    log("SAFE anomaly detection starting...");
+    safe_core_init();
+    safe_ml_init();
+    safe_uart_init();
+    while (true) delay(1s);
+}
+\end{lstlisting}
+UART task streams host data into safe core; once window filled, it triggers ML inference.
+
+\begin{verbatim}
+    safe_uart.c:
+\end{verbatim}
+\begin{lstlisting}
+    safe_uart_init() {
+        configure_uart0(115200);
+        start_task(uart_rx_task);
+    }
+    
+    uart_rx_task() {
+        while (true) {
+            bytes = uart_read(timeout=20ms);
+            accumulate_line(bytes);
+            if (line_complete) handle_line(line);
+        }
+    }
+    
+    handle_line(line) {
+        values = parse_16_floats(line);
+        full = safe_core_push_sample(values);
+        uart_write("OK: riga accettata");
+        if (full) safe_ml_run_inference();
+    }
+\end{lstlisting}
+Maintaining the 30×16 sliding window, optional preprocessing, quantization/dequantization helpers, and anomaly logging for both INT8 and float models.
+
+\begin{verbatim}
+    safe_core.c:
+\end{verbatim}
+\begin{lstlisting}
+    safe_core_init() { zero_window(); s_count = 0; s_ready = false; }
+    
+    safe_core_push_sample(sample[16]) {
+        preprocessed = preprocess_sample(sample);
+        slide_window(preprocessed);
+        return s_ready;
+    }
+    
+    safe_core_quantize_window_int8(dst) { copy_window_int8(dst, scale, zp); }
+    safe_core_fill_window_float(dst)    { copy_window_float(dst); }
+    
+    safe_core_postprocess_and_log(int8_output) {
+        max = dequant_and_find_max(int8_output);
+        log_scores(max);
+    }
+    
+    safe_core_postprocess_and_log_float(f32_output) {
+        maybe_log_raw_output(f32_output);
+    }
+\end{lstlisting}
+Converting the embedded TFLite model into a MicroInterpreter, registers all required ops, and delegates inference to the appropriate path based on tensor type.
+
+\begin{verbatim}
+    safe_ml.cpp: 
+\end{verbatim}
+\begin{lstlisting}
+    safe_ml_init() {
+        model = GetModel(model_int8_full_tflite);
+        resolver = MicroMutableOpResolver<128>(AddAbs, AddConv2D, ...);
+        interpreter = MicroInterpreter(model, resolver, tensor_arena);
+        interpreter.AllocateTensors();
+        s_input = interpreter->input(0);
+        s_output = interpreter->output(0);
+    }
+    
+    safe_ml_run_inference() {
+        if (s_input->type == INT8) run_inference_int8();
+        else if (s_input->type == FLOAT32) run_inference_float();
+    }
+    
+    run_inference_int8() {
+        safe_core_quantize_window_int8(s_input->data.int8);
+        interpreter->Invoke();
+        safe_core_postprocess_and_log(s_output->data.int8);
+    }
+    
+    run_inference_float() {
+        safe_core_fill_window_float(s_input->data.f);
+        interpreter->Invoke();
+        safe_core_postprocess_and_log_float(s_output->data.f);
+    }
+\end{lstlisting}
+So exec start in main, inizializing all files. Then UART parse 16 values, push them into the sliding window and triggers inference if 30 is reached. So then the safe ml grabs the window and runs tflite microinterpreter and hands the output back to safe core. The result it's displayed.
+
+\subsubsection{Flashing and debug}
+
+Note: In order to flash \& debug while printing from .py, we follow the pipeline explained before:
+Keeping JP3, JP8 always closed and the others opened, enter the flashing mode closing JP1, disconnecting sensor dongle (keeping only the debug/flash one, which name will be USB 0) pressing RESET and using:
+\begin{center}
+    idf.py -p /dev/ttyUSB0 build flash
+\end{center}
+(For check: ls /dev/ttyUSB*). Then, open JP1 and re-press RESET. We can now open the terminal:
+\begin{center}
+idf.py -p /dev/ttyUSB0 monitor
+\end{center}
+Now we can send on the gpio p4 using ttyusb1 on the .py script (dongle sensor).
+
+
+\subsubsection{Simplification}
+
+For an easier implementation, we will stay on a serial USB0 sending the window through the same port as the debug one. So we will write on TX and wait for ack on RX. At the end, a bigger wait for the inference. We will also use Float32 instead of int8. All these simplifications are made for a specific reason. We have to demonstrate that the model can run on the SECO ESP32 board as the U545RE. Of course the model is the same, and simply we can deploy the same modbus RTU with a different port for debug.
+
+\subsubsection{Solved problems}
+
+\begin{itemize}
+\item Converter segfaults :The first TFLite conversions were crashing (segmentation fault) because we were trying to quantize aggressively with a complex SavedModel + representative dataset. We had to build a clean inference-only Keras model (batch=1), then convert with Optimize.DEFAULT and a lighter rep dataset.
+\begin{lstlisting}[language=C]
+    inference_input = tf.keras.Input(
+        batch_shape=(1, WINDOW_SIZE, N_FEAT),
+        name="input_layer_fixed_batch"
+    )
+\end{lstlisting}
+\item Missing WHILE op on ESP32: switch to esp-tflite-micro that supports AddWhile() and actually register it.
+\item Naive op resolver (too few ops). Initially we only added the “obvious” ops (Conv2D, MaxPool2D, Dense, LSTM, Quantize, Dequantize). Runtime then exploded with new missing ops (ExpandDims, Shape, StridedSlice, Pack, etc.). We ended up with a “kitchen sink” resolver using everything.
+\end{itemize}
+
+\subsection{Sending from sensor}
+\begin{lstlisting}[language=Python]
+# Serial and input configuration
+PORT = "/dev/ttyUSB0"
+BAUD = 115200
+CSV  = "win_std.csv"
+
+# Protocol tokens sent by the ESP32
+ACK_TOKEN = "OK"
+RUN_TOKEN = "safe_ml_run_inference"
+RAW_END   = "RAW_OUT end"
+
+
+def wait_ack(serial, timeout):
+    # Wait for the ACK corresponding to a single transmitted line
+    while not timeout_expired(timeout):
+        for line in read_serial_lines(serial):
+            if ACK_TOKEN in line:
+                return True
+    return False
+
+
+def wait_inference(serial, timeout):
+    # Wait until inference starts and raw output is completed
+    inference_started = False
+
+    while not timeout_expired(timeout):
+        for line in read_serial_lines(serial):
+            if RUN_TOKEN in line:
+                inference_started = True
+            if inference_started and RAW_END in line:
+                return True
+    return False
+
+
+def main():
+    # Open UART connection
+    serial = open_serial(PORT, BAUD)
+
+    # Load standardized samples from CSV
+    lines = read_csv_lines(CSV)
+
+    # Phase 1: send samples one by one, waiting for ACK each time
+    for line in lines:
+        serial.write(line)
+        wait_ack(serial, timeout=1.5)
+
+    # Phase 2: wait for ML inference and final output
+    wait_inference(serial, timeout=10.0)
+
+    serial.close()
+
+
+if __name__ == "__main__":
+    main()
+\end{lstlisting}
+
 \section{Questions}
 
 \begin{itemize}
@@ -1632,22 +1892,19 @@ To avoid confusion, we briefly list the main errors encountered before reaching 
 
 The CNN architecture was chosen instead of a Spiking Neural Network (SpikeNN) for practical reasons. Although SpikeNN is more recent, potentially more efficient and with lower resource consumption, its training is demanding and difficult to get right in practice.
 
-\section*{References}
+% \section*{References}
 
-\begin{itemize}
-    \item Hochreiter, S.; Schmidhuber, J. (1997). Long Short-Term Memory. Neural Computation, 9(8), 1735–1780.
-    \item Malhotra, P.; Ramakrishnan, A.; Anand, G.; Vig, L.; Agarwal, P.; Shroff, G. (2016). LSTM-based Encoder–Decoder for Multi-sensor Anomaly Detection. arXiv:1607.00148.
-    \item Bai, S.; Kolter, J. Z.; Koltun, V. (2018). An Empirical Evaluation of Generic Convolutional and Recurrent Networks for Sequence Modeling. arXiv:1803.01271.
-    \item Zhang, C.; Song, D.; Chen, Y.; et al. (2019). MSCRED: A Deep Neural Network for Unsupervised Anomaly Detection and Diagnosis in Multivariate Time Series. AAAI 2019.
-    \item Zong, B.; Song, Q.; Min, M. R.; et al. (2018). Deep Autoencoding Gaussian Mixture Model for Unsupervised Anomaly Detection. ICLR 2018.
-    \item Su, Y.; Zhao, Y.; Niu, C.; et al. (2019). Robust Anomaly Detection for Multivariate Time Series through Stochastic RNN (OmniAnomaly). KDD 2019.
-    \item Xu, H.; Chen, W.; Zhao, N.; et al. (2018). Unsupervised Anomaly Detection via Variational Auto-Encoder for Seasonal KPIs in Web Applications (Donut). WWW 2018.
-    \item Bañós, O.; Gálvez, J.-M.; Damas, M.; Pomares, H.; Rojas, I. (2014). Window Size Impact in Human Activity Recognition. Sensors, 14(4), 6474–6499.
-    \item Ronao, C. A.; Cho, S.-B. (2016). Human Activity Recognition with Smartphone Sensors Using Deep Learning Neural Networks. Expert Systems with Applications, 59, 235–244.
-    \item Dehghani, A.; Nambiar, R.; Sharma, R.; et al. (2019). A Quantitative Comparison of Overlapping and Non-Overlapping Sliding Windows for HAR Using Inertial Sensors. Sensors, 19(22), 5026.
-    \item Randall, R. B.; Antoni, J. (2011). Rolling Element Bearing Diagnostics—A Tutorial. Mechanical Systems and Signal Processing, 25(2), 485–520.
-    \item Mohd Ghazali, M. H.; Rahiman, W. (2021). Vibration Analysis for Machine Monitoring and Diagnosis: A Systematic Review. Shock and Vibration, Article ID 9469318.
-\end{itemize}
-
-% FINE
-\end{document}
+% \begin{itemize}
+%     \item Hochreiter, S.; Schmidhuber, J. (1997). Long Short-Term Memory. Neural Computation, 9(8), 1735–1780.
+%     \item Malhotra, P.; Ramakrishnan, A.; Anand, G.; Vig, L.; Agarwal, P.; Shroff, G. (2016). LSTM-based Encoder–Decoder for Multi-sensor Anomaly Detection. arXiv:1607.00148.
+%     \item Bai, S.; Kolter, J. Z.; Koltun, V. (2018). An Empirical Evaluation of Generic Convolutional and Recurrent Networks for Sequence Modeling. arXiv:1803.01271.
+%     \item Zhang, C.; Song, D.; Chen, Y.; et al. (2019). MSCRED: A Deep Neural Network for Unsupervised Anomaly Detection and Diagnosis in Multivariate Time Series. AAAI 2019.
+%     \item Zong, B.; Song, Q.; Min, M. R.; et al. (2018). Deep Autoencoding Gaussian Mixture Model for Unsupervised Anomaly Detection. ICLR 2018.
+%     \item Su, Y.; Zhao, Y.; Niu, C.; et al. (2019). Robust Anomaly Detection for Multivariate Time Series through Stochastic RNN (OmniAnomaly). KDD 2019.
+%     \item Xu, H.; Chen, W.; Zhao, N.; et al. (2018). Unsupervised Anomaly Detection via Variational Auto-Encoder for Seasonal KPIs in Web Applications (Donut). WWW 2018.
+%     \item Bañós, O.; Gálvez, J.-M.; Damas, M.; Pomares, H.; Rojas, I. (2014). Window Size Impact in Human Activity Recognition. Sensors, 14(4), 6474–6499.
+%     \item Ronao, C. A.; Cho, S.-B. (2016). Human Activity Recognition with Smartphone Sensors Using Deep Learning Neural Networks. Expert Systems with Applications, 59, 235–244.
+%     \item Dehghani, A.; Nambiar, R.; Sharma, R.; et al. (2019). A Quantitative Comparison of Overlapping and Non-Overlapping Sliding Windows for HAR Using Inertial Sensors. Sensors, 19(22), 5026.
+%     \item Randall, R. B.; Antoni, J. (2011). Rolling Element Bearing Diagnostics—A Tutorial. Mechanical Systems and Signal Processing, 25(2), 485–520.
+%     \item Mohd Ghazali, M. H.; Rahiman, W. (2021). Vibration Analysis for Machine Monitoring and Diagnosis: A Systematic Review. Shock and Vibration, Article ID 9469318.
+% \end{itemize}
