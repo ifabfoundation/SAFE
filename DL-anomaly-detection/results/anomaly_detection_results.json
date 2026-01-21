@@ -1,0 +1,19 @@
+{
+  "model_used": "cnn_lstm",
+  "model_metrics": {
+    "rmse": 0.9686823790545505,
+    "r2": -0.3168891370296478,
+    "mae": 0.5897108316421509,
+    "mape": 252.7050018310547,
+    "mase": NaN
+  },
+  "total_data_points": 161902080,
+  "total_anomalies": 3354380,
+  "anomaly_percentage": 2.071857260882627,
+  "detection_method": "sigma",
+  "threshold": 3.0,
+  "residual_stats": {
+    "mean": -0.2314826399087906,
+    "std": 1.0136773586273193
+  }
+}
