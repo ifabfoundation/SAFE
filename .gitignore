@@ -1,0 +1,33 @@
+# Ambienti Python
+.mamba-env/
+.mamba-env-*/
+
+# Dati (symlink a /data/safe_data)
+data
+
+# File di sistema e IDE
+.idea/
+.ipynb_checkpoints/
+__pycache__/
+*.pyc
+
+# Log e output
+logs/
+outputs/
+
+# File temporanei e vecchi
+*.save
+=2.15
+
+# Script SLURM e jupyter
+jupyter_slurm/
+provaslurm.sh
+start.sh
+
+# Cartelle utente (verranno aggiunte selettivamente)
+notebooks/
+scripts/
+pretrained_models/
+
+# File HTML
+*.html
