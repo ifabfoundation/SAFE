@@ -1,0 +1,65 @@
+# ============================================================
+# SAFE Project — .gitignore
+# ============================================================
+
+# === Python ===
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# === Environments ===
+.mamba-env/
+.mamba-env-*/
+.venv/
+.conda/
+
+# === Data (symlink to shared storage — proprietary) ===
+data
+
+# === Proprietary / confidential outputs ===
+# Docs, notebooks, figures, results, and pretrained models
+# contain information derived from industrial partner data
+# and must NOT be published.
+docs/
+notebooks/
+figures_output/
+results/
+pretrained_models/
+
+# === Scripts (contain credentials / data paths) ===
+scripts/
+
+# === IDE / Editor ===
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.code-workspace
+
+# === Jupyter ===
+.ipynb_checkpoints/
+
+# === Logs and outputs ===
+logs/
+outputs/
+
+# === Trained models ===
+*.pth
+*.keras
+*.tflite
+*.h5
+*.onnx
+*.savedmodel/
+
+# === OS files ===
+.DS_Store
+Thumbs.db
+
+# === Temporary / legacy ===
+*.save
+*.html

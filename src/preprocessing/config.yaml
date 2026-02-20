@@ -1,0 +1,227 @@
+# Bonfiglioli Anomaly Detection Pipeline Configuration
+
+# ============================================================================
+# PATH CONFIGURATION
+# ============================================================================
+paths:
+  # Directory contenente i file H5
+  data_directory: "/home/projects/safe/data/bonfiglioli/ETR_946 - Prova 30 - 310 - Fatica/"
+  
+  # Directory per i dati processati (CSV allineati)
+  output_directory: "/home/projects/safe/src/giacomopiergentili/project/data/processed/"
+  
+  # Directory per i dati con features ingegnerizzate
+  features_directory: "/home/projects/safe/src/giacomopiergentili/project/data/features/"
+  
+  # Directory per i plot e risultati EDA
+  plots_directory: "/home/projects/safe/src/giacomopiergentili/project/plots/"
+  
+  # Directory per salvare i modelli addestrati
+  model_directory: "/home/projects/safe/src/giacomopiergentili/project/models/"
+  
+  # Pattern per ricerca ricorsiva file H5 (batch processing)
+  h5_pattern: "**/*.h5"
+
+# ============================================================================
+# SIGNAL CONFIGURATION
+# ============================================================================
+signals:
+  # Segnali di vibrazione (RMS)
+  vibration:
+    - name: "vib_rid_marcia_rms"
+      group: "Vibration"
+      sensor: "AccRidMarcia_RMS"
+      subgroup: "PreProcess"
+      column: "RMS_ISO"
+      description: "Vibrazione riduttore marcia - RMS"
+    
+    - name: "vib_rid_marc2_rms"
+      group: "Vibration"
+      sensor: "AccRidMarc2_RMS"
+      subgroup: "PreProcess"
+      column: "RMS_ISO"
+      description: "Vibrazione riduttore marcia 2 - RMS"
+    
+    - name: "vib_mot_marcia_rms"
+      group: "Vibration"
+      sensor: "AccMotMarcia_RMS"
+      subgroup: "PreProcess"
+      column: "RMS_ISO"
+      description: "Vibrazione motore marcia - RMS"
+  
+  # Segnali di temperatura
+  temperature:
+    - name: "temp_cassa_riduttore"
+      group: "Temperature"
+      sensor: "CASSA RIDUTTORE"
+      subgroup: "PreProcess"
+      column: "None"
+      description: "Temperatura cassa riduttore"
+    
+    - name: "temp_oil_marcia"
+      group: "Temperature"
+      sensor: "T_Oil_Marcia"
+      subgroup: "PreProcess"
+      column: "None"
+      description: "Temperatura olio marcia"
+    
+    - name: "temp_mot_marcia"
+      group: "Temperature"
+      sensor: "T_Mot_Marcia"
+      subgroup: "PreProcess"
+      column: "None"
+      description: "Temperatura motore marcia"
+  
+    - name: "temp_pt100_oil"
+      group: "Temperature"
+      sensor: "PT100_Oil"
+      subgroup: "PreProcess"
+      column: "None"
+      description: "Temperatura PT100 olio"
+  
+  # Segnali generici
+  generic:
+    - name: "tan_oil"
+      group: "Generic"
+      sensor: "TAN_Oil"
+      subgroup: "PreProcess"
+      column: "None"
+      description: "TAN Oil"
+  
+  # Segnali fieldbus (Inverter 1 - MARCIA)
+  fieldbus:
+    - name: "fb_rms_curr"
+      group: "Fieldbus"
+      sensor: "1_211_RmsCurr"
+      subgroup: "RAW"
+      column: null
+      description: "RMS Current"
+    
+    - name: "fb_active_cur"
+      group: "Fieldbus"
+      sensor: "1_214_ActiveCur"
+      subgroup: "RAW"
+      column: null
+      description: "Active Current"
+    
+    - name: "fb_isq"
+      group: "Fieldbus"
+      sensor: "1_216_Isq"
+      subgroup: "RAW"
+      column: null
+      description: "Isq Current Component"
+    
+    - name: "fb_encoder1"
+      group: "Fieldbus"
+      sensor: "1_218_Encoder1"
+      subgroup: "RAW"
+      column: null
+      description: "Encoder 1"
+    
+    - name: "fb_actual_spe"
+      group: "Fieldbus"
+      sensor: "1_240_ActualSpe"
+      subgroup: "RAW"
+      column: null
+      description: "Actual Speed"
+    
+    - name: "fb_actual_freq"
+      group: "Fieldbus"
+      sensor: "1_241_ActualFreq"
+      subgroup: "RAW"
+      column: null
+      description: "Actual Frequency"
+
+# ============================================================================
+# ANOMALY DETECTION MODEL CONFIGURATION
+# ============================================================================
+model:
+  # Tipo di modello
+  type: "IsolationForest"
+  
+  # Parametri Isolation Forest
+  isolation_forest:
+    contamination: 0.05        # Proporzione attesa di anomalie (5%)
+    n_estimators: 200          # Numero di alberi
+    random_state: 42           # Seed per riproducibilità
+    n_jobs: -1                 # Usa tutti i core disponibili
+
+# ============================================================================
+# FEATURE ENGINEERING CONFIGURATION
+# ============================================================================
+feature_engineering:
+  # Parametri rolling window
+  window_size: 50              # Dimensione finestra rolling
+  min_periods: 1               # Minimo periodi per calcolo
+  
+  # Features calcolate automaticamente per temperature e vibrazioni:
+  # - {signal}_mean: media mobile
+  # - {signal}_std: deviazione standard mobile  
+  # - {signal}_min: minimo mobile
+  # - {signal}_max: massimo mobile
+  #
+  # I segnali fieldbus (fb_*) NON vengono processati
+
+# ============================================================================
+# PREPROCESSING CONFIGURATION
+# ============================================================================
+preprocessing:
+  # Interpolazione per allineamento temporale
+  interpolation:
+    method: "linear"           # Tipo di interpolazione
+    fill_value: "extrapolate"  # Gestione valori fuori range
+  
+  # Normalizzazione
+  normalization:
+    method: "StandardScaler"   # Tipo di normalizzazione
+
+# ============================================================================
+# OUTPUT CONFIGURATION
+# ============================================================================
+output:
+  # Salvataggio risultati
+  save_csv:
+    all_data: true             # Salva tutti i dati con anomalie
+    anomalies_only: true       # Salva solo le anomalie
+  
+  save_json:
+    statistics: true           # Salva statistiche in JSON
+  
+  save_model:
+    pickle: true               # Salva modello in pickle
+  
+  # Visualizzazione
+  visualization:
+    save_plots: true           # Salva grafici come PNG
+    dpi: 150                   # Risoluzione grafici
+    figsize: [16, 20]          # Dimensioni figura (width, height)
+    show_anomalies: true       # Mostra marker anomalie (default)
+    
+    # Binning per istogramma temporale
+    histogram:
+      bin_size_hours: 0.5      # Dimensione bin in ore
+
+# ============================================================================
+# BATCH PROCESSING CONFIGURATION
+# ============================================================================
+batch_processing:
+  enabled: false               # Abilita batch processing
+  verbose: false               # Output dettagliato per ogni file
+  continue_on_error: true      # Continua se un file fallisce
+  save_summary: true           # Salva summary CSV con tutti i file
+  
+  # Filtri per file
+  filters:
+    min_file_size_mb: 1        # Dimensione minima file (MB)
+    exclude_patterns:          # Pattern da escludere
+      - "*_backup*"
+      - "*_test*"
+
+# ============================================================================
+# LOGGING CONFIGURATION
+# ============================================================================
+logging:
+  level: "INFO"                # DEBUG, INFO, WARNING, ERROR
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  progress_bars: true          # Usa tqdm per progress bars
+
